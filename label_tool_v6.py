@@ -46,6 +46,8 @@ TEXT_COLOR = (0, 255, 255)  # BGR
 
 HISTORY = 4  # history frames overlay
 FRAME_CACHE_LIMIT = 120
+MARKER_RADIUS_MIN = 2
+MARKER_RADIUS_MAX = 12
 COLORS = [
     QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255),
     QColor(255, 165, 0), QColor(128, 0, 128), QColor(0, 255, 255),
@@ -123,6 +125,10 @@ def is_dark_frame(frame: np.ndarray) -> bool:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return float(gray.mean()) < 3.0 and int(gray.max()) < 18
 
+def marker_radius_for_frame(frame_h: int, frame_w: int) -> int:
+    radius = int(min(frame_h, frame_w) * 0.002)
+    return max(MARKER_RADIUS_MIN, min(MARKER_RADIUS_MAX, radius))
+
 def choose_video_with_dialog(initial_dir: str) -> Optional[str]:
     video_filter = (
         "Video files (*.mp4 *.avi *.mov *.mkv *.m4v *.wmv *.mpg *.mpeg);;"
@@ -147,22 +153,75 @@ def resolve_video_path() -> Optional[str]:
 # ======================
 # Graphics View
 # ======================
-class VideoView(QGraphicsView):
+class VideoView(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
-        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
-        self.pixmap_item = QGraphicsPixmapItem()
-        self.scene.addItem(self.pixmap_item)
-        if parent is not None:
-            self.setSceneRect(0, 0, parent.frame_w, parent.frame_h)
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(320, 240)
+        self.setStyleSheet("background-color: #111;")
+        self.source_pixmap: Optional[QPixmap] = None
+        self.displayed_pixmap: Optional[QPixmap] = None
+        self.frame_w = 1
+        self.frame_h = 1
+        self.zoom_factor = 1.0
+
+    def set_frame_pixmap(self, pixmap: QPixmap, width: int, height: int):
+        self.source_pixmap = pixmap
+        self.frame_w = max(1, int(width))
+        self.frame_h = max(1, int(height))
+        self.update_display()
+
+    def clear_frame(self):
+        self.source_pixmap = None
+        self.displayed_pixmap = None
+        self.clear()
+
+    def update_display(self):
+        if self.source_pixmap is None or self.source_pixmap.isNull():
+            self.clear()
+            return
+        base_size = self.source_pixmap.size()
+        base_size.scale(self.size(), Qt.KeepAspectRatio)
+        target_w = max(1, int(base_size.width() * self.zoom_factor))
+        target_h = max(1, int(base_size.height() * self.zoom_factor))
+        self.displayed_pixmap = self.source_pixmap.scaled(
+            target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        self.setPixmap(self.displayed_pixmap)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_display()
+
+    def scale(self, factor_x, factor_y):
+        self.zoom_factor = max(0.2, min(8.0, self.zoom_factor * float(factor_x)))
+        self.update_display()
+
+    def resetTransform(self):
+        self.zoom_factor = 1.0
+        self.update_display()
+
+    def fitInView(self, *args, **kwargs):
+        self.zoom_factor = 1.0
+        self.update_display()
+
+    def sceneRect(self):
+        return None
 
     def map_to_frame_xy(self, event):
-        pt = self.mapToScene(event.pos())
-        return int(pt.x()), int(pt.y())
+        pix = self.displayed_pixmap
+        if pix is None or pix.isNull():
+            return -1, -1
+        offset_x = (self.width() - pix.width()) / 2.0
+        offset_y = (self.height() - pix.height()) / 2.0
+        px = event.pos().x() - offset_x
+        py = event.pos().y() - offset_y
+        if px < 0 or py < 0 or px >= pix.width() or py >= pix.height():
+            return -1, -1
+        x = int(px * self.frame_w / pix.width())
+        y = int(py * self.frame_h / pix.height())
+        return x, y
 
     def mousePressEvent(self, event):
         if self.window() is None:
@@ -234,10 +293,10 @@ class MainWindow(QMainWindow):
         zoom_widget.setLayout(zoom_layout)
 
         # Show history
-        self.show_history = True
+        self.show_history = False
         self.history_checkbox = QCheckBox("Show last 4 frames")
         self.history_checkbox.setFont(font)
-        self.history_checkbox.setChecked(True)
+        self.history_checkbox.setChecked(False)
         self.history_checkbox.stateChanged.connect(self.on_history_toggled)
 
         # Frame/Status labels
@@ -246,6 +305,10 @@ class MainWindow(QMainWindow):
         self.frame_label.setFont(font)
         self.event_label = QLabel("Event: 0")
         self.event_label.setFont(font)
+        font.setPointSize(12)
+        self.decode_label = QLabel("Video: none")
+        self.decode_label.setFont(font)
+        self.decode_label.setWordWrap(True)
 
         font.setPointSize(14)
         self.open_video_btn = QPushButton("Open Video")
@@ -301,8 +364,8 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.open_video_btn)
         left_layout.addSpacing(16)
         left_layout.addWidget(self.event_label)
+        left_layout.addWidget(self.decode_label)
         left_layout.addStretch(1)
-        left_layout.addWidget(self.history_checkbox)
 
         ctrl_panel = QWidget()
         cp_layout = QHBoxLayout(ctrl_panel)
@@ -352,10 +415,10 @@ class MainWindow(QMainWindow):
     def show_empty_view(self):
         self.timer.stop()
         self.play_btn.setText("Play")
-        self.video_view.pixmap_item.setPixmap(QPixmap())
-        self.video_view.scene.setSceneRect(0, 0, 1, 1)
+        self.video_view.clear_frame()
         self.frame_label.setText("Frame: -/-")
         self.event_label.setText("Event: 0")
+        self.decode_label.setText("Video: none")
         self.slider.setRange(0, 0)
         self.slider.setValue(0)
         self.setWindowTitle("Label Tool (PyQt5)")
@@ -623,9 +686,11 @@ class MainWindow(QMainWindow):
             return
         src = self.get_frame(self.current_frame).copy()
         display = cv2.convertScaleAbs(src, alpha=self.brightness, beta=0)
+        frame_mean = float(src.mean())
+        frame_max = int(src.max())
 
         # draw history with fading alpha
-        marker_radius = max(1, int(min(self.frame_h, self.frame_w) * 0.002))
+        marker_radius = marker_radius_for_frame(self.frame_h, self.frame_w)
         font_scale = max(0.3, marker_radius / 4.0)
         thickness = max(1, marker_radius)
 
@@ -647,17 +712,27 @@ class MainWindow(QMainWindow):
         if rowc and rowc['Visibility']:
             cv2.circle(display, (int(rowc['X']), int(rowc['Y'])), marker_radius, LABEL_COLOR, -1)
 
-        # push to view
-        h, w, ch = display.shape
-        qimg = QImage(display.data, w, h, ch*w, QImage.Format_BGR888)
-        pix = QPixmap.fromImage(qimg.copy())
-        self.video_view.pixmap_item.setPixmap(pix)
-        self.video_view.scene.setSceneRect(0, 0, self.frame_w, self.frame_h)
+        # Push to Qt through encoded image bytes instead of raw ndarray memory.
+        # This avoids format/stride issues that can show up as black or rainbow frames.
+        ok, encoded = cv2.imencode('.png', display)
+        pix = QPixmap()
+        if ok:
+            pix.loadFromData(encoded.tobytes(), 'PNG')
+        if not ok or pix.isNull():
+            debug_path = None
+            if self.csv_path:
+                debug_path = os.path.join(os.path.dirname(self.csv_path), 'debug_last_frame.png')
+                cv2.imwrite(debug_path, display)
+            detail = f"Saved debug frame to:\n{debug_path}" if debug_path else "No debug path is available."
+            QMessageBox.warning(self, "Display failed", f"Qt could not create a pixmap from this frame.\n{detail}")
+            return
+        self.video_view.set_frame_pixmap(pix, self.frame_w, self.frame_h)
 
         # labels
         ev = rowc['Event'] if rowc else 0
         self.frame_label.setText(f"Frame: {self.current_frame}/{self.total_frames-1}")
         self.event_label.setText(f"Event: {ev}")
+        self.decode_label.setText(f"Decoded: mean {frame_mean:.1f}, max {frame_max}")
         self.slider.setValue(self.current_frame)
 
     # ---------- Key handling ----------
