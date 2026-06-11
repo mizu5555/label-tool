@@ -119,6 +119,10 @@ def csv_path_for_video(video_path: str, create_dir: bool = True) -> str:
     csv_file_name = os.path.splitext(os.path.basename(video_path))[0] + '_ball.csv'
     return os.path.join(csv_dir, csv_file_name)
 
+def is_dark_frame(frame: np.ndarray) -> bool:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(gray.mean()) < 3.0 and int(gray.max()) < 18
+
 def choose_video_with_dialog(initial_dir: str) -> Optional[str]:
     video_filter = (
         "Video files (*.mp4 *.avi *.mov *.mkv *.m4v *.wmv *.mpg *.mpeg);;"
@@ -405,6 +409,17 @@ class MainWindow(QMainWindow):
         if total_frames <= 0:
             total_frames = 1
 
+        initial_frame_idx = 0
+        if is_dark_frame(first_frame):
+            search_limit = min(total_frames, 600)
+            for idx in range(1, search_limit):
+                new_cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, candidate = new_cap.read()
+                if ret and not is_dark_frame(candidate):
+                    initial_frame_idx = idx
+                    first_frame = candidate
+                    break
+
         self.timer.stop()
         self.play_btn.setText("Play")
         if self.cap is not None:
@@ -416,15 +431,15 @@ class MainWindow(QMainWindow):
         self.total_frames = total_frames
         self.frame_h, self.frame_w = first_frame.shape[:2]
         self.frame_cache = OrderedDict()
-        self.frame_cache[0] = first_frame
-        self.current_frame = 0
+        self.frame_cache[initial_frame_idx] = first_frame
+        self.current_frame = initial_frame_idx
         self.brightness = 1.0
         self.csv_path = csv_path_for_video(video_path, create_dir=True)
         self.df = {}
         self.load_csv_if_any()
 
         self.slider.setRange(0, self.total_frames - 1)
-        self.slider.setValue(0)
+        self.slider.setValue(self.current_frame)
         self.zoom_slider.setValue(0)
         self.speed_slider.setValue(10)
         self.set_video_controls_enabled(True)
@@ -635,7 +650,7 @@ class MainWindow(QMainWindow):
         # push to view
         h, w, ch = display.shape
         qimg = QImage(display.data, w, h, ch*w, QImage.Format_BGR888)
-        pix = QPixmap.fromImage(qimg)
+        pix = QPixmap.fromImage(qimg.copy())
         self.video_view.pixmap_item.setPixmap(pix)
         self.video_view.scene.setSceneRect(0, 0, self.frame_w, self.frame_h)
 
