@@ -100,12 +100,24 @@ def prompt_video_from_console(video_dir: str) -> Optional[str]:
     if not vids:
         return None
     for i, f in enumerate(vids):
-        csv_dir = os.path.join(os.path.dirname(video_dir), 'csv')
-        csv_name = os.path.join(csv_dir, os.path.splitext(f)[0] + '_ball.csv')
-        flag = os.path.isfile(csv_name)
+        video_path = os.path.join(video_dir, f)
+        flag = os.path.isfile(csv_path_for_video(video_path, create_dir=False))
         print(f"{i+1:3d}: {f}{' (labeled)' if flag else ''}")
     idx = int(input('Enter the video number: '))
     return os.path.join(video_dir, vids[idx-1])
+
+def csv_path_for_video(video_path: str, create_dir: bool = True) -> str:
+    video_path = os.path.abspath(video_path)
+    video_dir = os.path.dirname(video_path)
+    if os.path.basename(video_dir).lower() == 'video':
+        output_root = os.path.dirname(video_dir)
+    else:
+        output_root = video_dir
+    csv_dir = os.path.join(output_root, 'csv')
+    if create_dir:
+        ensure_dir(csv_dir)
+    csv_file_name = os.path.splitext(os.path.basename(video_path))[0] + '_ball.csv'
+    return os.path.join(csv_dir, csv_file_name)
 
 def choose_video_with_dialog(initial_dir: str) -> Optional[str]:
     video_filter = (
@@ -126,14 +138,7 @@ def resolve_video_path() -> Optional[str]:
 
     work_dir = app_base_dir() if len(sys.argv) < 2 else os.path.abspath(sys.argv[1])
     os.chdir(work_dir)
-    video_dir = os.path.join(work_dir, 'video')
-
-    if has_console():
-        video_path = prompt_video_from_console(video_dir)
-        if video_path:
-            return video_path
-
-    return choose_video_with_dialog(video_dir if os.path.isdir(video_dir) else work_dir)
+    return None
 
 # ======================
 # Graphics View
@@ -159,6 +164,8 @@ class VideoView(QGraphicsView):
         if self.window() is None:
             return super().mousePressEvent(event)
         mw = self.window()
+        if not getattr(mw, 'video_path', None):
+            return super().mousePressEvent(event)
         x, y = self.map_to_frame_xy(event)
         if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
             if event.button() == Qt.LeftButton:
@@ -183,41 +190,20 @@ class VideoView(QGraphicsView):
 # Main Window
 # ======================
 class MainWindow(QMainWindow):
-    def __init__(self, video_path: str):
+    def __init__(self, video_path: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("Label Tool (PyQt5)")
 
-        # Video
-        self.video_path = video_path
-        self.cap = cv2.VideoCapture(video_path)
-        if not self.cap.isOpened():
-            raise ValueError(f"Cannot open video: {video_path}")
-
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-        ret, first_frame = self.cap.read()
-        if not ret:
-            raise ValueError("Cannot load video or video has no frames.")
-        if self.total_frames <= 0:
-            self.total_frames = 1
-
+        # Video / data state
+        self.video_path: Optional[str] = None
+        self.csv_path: Optional[str] = None
+        self.cap: Optional[cv2.VideoCapture] = None
         self.frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
-        self.frame_cache[0] = first_frame
-        self.frame_h, self.frame_w = first_frame.shape[:2]
-
-        # CSV paths
-        parent_dir = os.path.dirname(os.path.dirname(video_path))
-        csv_dir = os.path.join(parent_dir, 'csv')
-        ensure_dir(csv_dir)
-        csv_file_name = os.path.splitext(os.path.basename(video_path))[0] + '_ball.csv'
-        self.csv_path = os.path.join(csv_dir, csv_file_name)
-
-        # DataFrame-like dict of dicts (index->row dict)
         self.df: Dict[int, Dict] = {}
-        self.load_csv_if_any()
-
-        # UI State
+        self.fps = 30.0
+        self.total_frames = 0
+        self.frame_h = 1
+        self.frame_w = 1
         self.scale = 1.0
         self.playback_speed = 1.0
         self.current_frame = 0
@@ -252,10 +238,15 @@ class MainWindow(QMainWindow):
 
         # Frame/Status labels
         font.setPointSize(20)
-        self.frame_label = QLabel(f"Frame: 0/{self.total_frames-1}")
+        self.frame_label = QLabel("Frame: -/-")
         self.frame_label.setFont(font)
         self.event_label = QLabel("Event: 0")
         self.event_label.setFont(font)
+
+        font.setPointSize(14)
+        self.open_video_btn = QPushButton("Open Video")
+        self.open_video_btn.setFont(font)
+        self.open_video_btn.clicked.connect(self.open_video_dialog)
 
         # Navigation & controls
         font.setPointSize(16)
@@ -283,7 +274,7 @@ class MainWindow(QMainWindow):
 
         # Frame slider
         self.slider = QSlider(Qt.Horizontal)
-        self.slider.setRange(0, self.total_frames - 1)
+        self.slider.setRange(0, 0)
         self.slider.sliderMoved.connect(self.seek_frame)
 
         # Brightness
@@ -303,6 +294,7 @@ class MainWindow(QMainWindow):
         self.event_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         left_layout.addSpacing(16)
         left_layout.addWidget(self.frame_label)
+        left_layout.addWidget(self.open_video_btn)
         left_layout.addSpacing(16)
         left_layout.addWidget(self.event_label)
         left_layout.addStretch(1)
@@ -335,13 +327,115 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next_frame)
 
-        # Initial draw
+        self.set_video_controls_enabled(False)
+        self.show_empty_view()
+
+        if video_path:
+            self.load_video(video_path)
+
+    # ---------- Data IO ----------
+    def has_video(self) -> bool:
+        return bool(self.video_path and self.cap is not None)
+
+    def set_video_controls_enabled(self, enabled: bool):
+        for widget in (
+            self.zoom_slider, self.history_checkbox, self.play_btn,
+            self.prev50_btn, self.prev1_btn, self.next1_btn, self.next50_btn,
+            self.speed_slider, self.slider, self.brighten_btn, self.darken_btn,
+        ):
+            widget.setEnabled(enabled)
+
+    def show_empty_view(self):
+        self.timer.stop()
+        self.play_btn.setText("Play")
+        self.video_view.pixmap_item.setPixmap(QPixmap())
+        self.video_view.scene.setSceneRect(0, 0, 1, 1)
+        self.frame_label.setText("Frame: -/-")
+        self.event_label.setText("Event: 0")
+        self.slider.setRange(0, 0)
+        self.slider.setValue(0)
+        self.setWindowTitle("Label Tool (PyQt5)")
+
+    def maybe_save_current_video(self) -> bool:
+        if not self.has_video():
+            return True
+        ans = QMessageBox.question(
+            self, "Open another video", "Save current labels before opening another video?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
+        )
+        if ans == QMessageBox.Yes:
+            try:
+                self.save_csv()
+            except Exception as e:
+                QMessageBox.warning(self, "Save failed", str(e))
+                return False
+            return True
+        if ans == QMessageBox.No:
+            return True
+        return False
+
+    def open_video_dialog(self):
+        if not self.maybe_save_current_video():
+            return
+        if self.video_path:
+            initial_dir = os.path.dirname(self.video_path)
+        else:
+            video_dir = os.path.join(app_base_dir(), 'video')
+            initial_dir = video_dir if os.path.isdir(video_dir) else app_base_dir()
+        video_path = choose_video_with_dialog(initial_dir)
+        if not video_path:
+            return
+        try:
+            self.load_video(video_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Failed to open video", str(e))
+
+    def load_video(self, video_path: str):
+        video_path = os.path.abspath(video_path)
+        new_cap = cv2.VideoCapture(video_path)
+        if not new_cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+
+        fps = new_cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(new_cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        ret, first_frame = new_cap.read()
+        if not ret:
+            new_cap.release()
+            raise ValueError("Cannot load video or video has no frames.")
+        if total_frames <= 0:
+            total_frames = 1
+
+        self.timer.stop()
+        self.play_btn.setText("Play")
+        if self.cap is not None:
+            self.cap.release()
+
+        self.video_path = video_path
+        self.cap = new_cap
+        self.fps = fps
+        self.total_frames = total_frames
+        self.frame_h, self.frame_w = first_frame.shape[:2]
+        self.frame_cache = OrderedDict()
+        self.frame_cache[0] = first_frame
+        self.current_frame = 0
+        self.brightness = 1.0
+        self.csv_path = csv_path_for_video(video_path, create_dir=True)
+        self.df = {}
+        self.load_csv_if_any()
+
+        self.slider.setRange(0, self.total_frames - 1)
+        self.slider.setValue(0)
+        self.zoom_slider.setValue(0)
+        self.speed_slider.setValue(10)
+        self.set_video_controls_enabled(True)
+        self.setWindowTitle(f"Label Tool - {os.path.basename(video_path)}")
         self.update_frame()
         self.video_view.resetTransform()
         self.video_view.fitInView(self.video_view.sceneRect(), Qt.KeepAspectRatio)
 
-    # ---------- Data IO ----------
     def get_frame(self, idx: int) -> np.ndarray:
+        if self.cap is None:
+            raise ValueError("No video is loaded.")
         if idx in self.frame_cache:
             self.frame_cache.move_to_end(idx)
             return self.frame_cache[idx]
@@ -360,6 +454,9 @@ class MainWindow(QMainWindow):
         return frame
 
     def load_csv_if_any(self):
+        if not self.csv_path:
+            self.df = {}
+            return
         if os.path.isfile(self.csv_path):
             df = pd.read_csv(self.csv_path)
             if not set(COLUMNS).issubset(df.columns):
@@ -381,6 +478,8 @@ class MainWindow(QMainWindow):
             self.df[0] = empty_row(0, self.fps)
 
     def save_csv(self):
+        if not self.csv_path:
+            raise ValueError("No video is loaded.")
         # Ensure contiguous rows up to last frame labeled or total_frames-1
         last_idx = max(self.df.keys()) if self.df else 0
         rows = []
@@ -413,17 +512,24 @@ class MainWindow(QMainWindow):
 
     def on_history_toggled(self, state):
         self.show_history = (state == Qt.Checked)
-        self.update_frame()
+        if self.has_video():
+            self.update_frame()
 
     def on_brighten(self):
+        if not self.has_video():
+            return
         self.brightness = min(self.brightness + self.brightness_step, 3.0)
         self.update_frame()
 
     def on_darken(self):
+        if not self.has_video():
+            return
         self.brightness = max(self.brightness - self.brightness_step, 0.1)
         self.update_frame()
 
     def play_pause(self):
+        if not self.has_video():
+            return
         if self.timer.isActive():
             self.timer.stop()
             self.play_btn.setText("Play")
@@ -435,6 +541,8 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("Pause")
 
     def next_frame(self):
+        if not self.has_video():
+            return
         if self.current_frame + 1 < self.total_frames:
             self.current_frame += 1
             self.update_frame()
@@ -443,6 +551,8 @@ class MainWindow(QMainWindow):
             self.play_btn.setText("Play")
 
     def seek_frame(self, idx: int):
+        if not self.has_video():
+            return
         idx = max(0, min(self.total_frames - 1, int(idx)))
         self.current_frame = idx
         self.update_frame()
@@ -453,6 +563,8 @@ class MainWindow(QMainWindow):
             self.df[idx] = empty_row(idx, self.fps)
 
     def set_point_at(self, x: int, y: int):
+        if not self.has_video():
+            return
         self.ensure_row(self.current_frame)
         row = self.df[self.current_frame]
         row['Visibility'] = 1
@@ -491,6 +603,9 @@ class MainWindow(QMainWindow):
 
     # ---------- Paint ----------
     def update_frame(self):
+        if not self.has_video():
+            self.show_empty_view()
+            return
         src = self.get_frame(self.current_frame).copy()
         display = cv2.convertScaleAbs(src, alpha=self.brightness, beta=0)
 
@@ -535,6 +650,15 @@ class MainWindow(QMainWindow):
         k = event.key()
         text = event.text()
         handled = True
+
+        if not self.has_video():
+            if k == Qt.Key_Escape:
+                self.close()
+            else:
+                handled = False
+            if not handled:
+                super().keyPressEvent(event)
+            return
 
         if text == KEY_LastFrame:
             self.seek_frame(self.current_frame - 1)
@@ -589,6 +713,9 @@ class MainWindow(QMainWindow):
 
     # ---------- Close ----------
     def confirm_close(self):
+        if not self.has_video():
+            self.close()
+            return
         ans = QMessageBox.question(
             self, "Confirm Exit", "Save and quit?",
             QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel
@@ -605,6 +732,9 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
+        if not self.has_video():
+            event.accept()
+            return
         # Ensure user gets a chance to save
         ans = QMessageBox.question(
             self, "Confirm Exit", "Save and quit?",
@@ -615,10 +745,12 @@ class MainWindow(QMainWindow):
                 self.save_csv()
             except Exception as e:
                 QMessageBox.warning(self, "Save failed", str(e))
-            self.cap.release()
+            if self.cap is not None:
+                self.cap.release()
             event.accept()
         elif ans == QMessageBox.No:
-            self.cap.release()
+            if self.cap is not None:
+                self.cap.release()
             event.accept()
         else:
             event.ignore()
@@ -631,14 +763,11 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
 
     video_name = resolve_video_path()
-    if not video_name:
-        sys.exit(0)
-
     try:
         w = MainWindow(video_name)
     except Exception as e:
         QMessageBox.critical(None, "Failed to open video", str(e))
-        sys.exit(1)
+        w = MainWindow()
 
     w.showMaximized()
     sys.exit(app.exec_())
