@@ -1,0 +1,5 @@
+numpy>=1.26
+pandas>=2.2
+opencv-python-headless>=4.10
+PyQt5>=5.15.10,<5.16
+pyinstaller>=6.10
