@@ -4,6 +4,7 @@ import json
 import time
 import math
 import csv
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 
@@ -44,6 +45,7 @@ TEXT_SIZE = 0.8
 TEXT_COLOR = (0, 255, 255)  # BGR
 
 HISTORY = 4  # history frames overlay
+FRAME_CACHE_LIMIT = 120
 COLORS = [
     QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255),
     QColor(255, 165, 0), QColor(128, 0, 128), QColor(0, 255, 255),
@@ -188,20 +190,21 @@ class MainWindow(QMainWindow):
         # Video
         self.video_path = video_path
         self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise ValueError(f"Cannot open video: {video_path}")
+
         self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        self.frames: List[np.ndarray] = []
-        while True:
-            ret, frame = self.cap.read()
-            if not ret:
-                break
-            self.frames.append(frame)
-        self.cap.release()
-        if not self.frames:
+        ret, first_frame = self.cap.read()
+        if not ret:
             raise ValueError("Cannot load video or video has no frames.")
+        if self.total_frames <= 0:
+            self.total_frames = 1
 
-        self.total_frames = len(self.frames)
-        self.frame_h, self.frame_w = self.frames[0].shape[:2]
+        self.frame_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+        self.frame_cache[0] = first_frame
+        self.frame_h, self.frame_w = first_frame.shape[:2]
 
         # CSV paths
         parent_dir = os.path.dirname(os.path.dirname(video_path))
@@ -338,6 +341,24 @@ class MainWindow(QMainWindow):
         self.video_view.fitInView(self.video_view.sceneRect(), Qt.KeepAspectRatio)
 
     # ---------- Data IO ----------
+    def get_frame(self, idx: int) -> np.ndarray:
+        if idx in self.frame_cache:
+            self.frame_cache.move_to_end(idx)
+            return self.frame_cache[idx]
+
+        pos = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if pos != idx:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+
+        ret, frame = self.cap.read()
+        if not ret:
+            raise ValueError(f"Cannot read frame {idx}.")
+
+        self.frame_cache[idx] = frame
+        while len(self.frame_cache) > FRAME_CACHE_LIMIT:
+            self.frame_cache.popitem(last=False)
+        return frame
+
     def load_csv_if_any(self):
         if os.path.isfile(self.csv_path):
             df = pd.read_csv(self.csv_path)
@@ -470,7 +491,7 @@ class MainWindow(QMainWindow):
 
     # ---------- Paint ----------
     def update_frame(self):
-        src = self.frames[self.current_frame].copy()
+        src = self.get_frame(self.current_frame).copy()
         display = cv2.convertScaleAbs(src, alpha=self.brightness, beta=0)
 
         # draw history with fading alpha
@@ -594,8 +615,10 @@ class MainWindow(QMainWindow):
                 self.save_csv()
             except Exception as e:
                 QMessageBox.warning(self, "Save failed", str(e))
+            self.cap.release()
             event.accept()
         elif ans == QMessageBox.No:
+            self.cap.release()
             event.accept()
         else:
             event.ignore()
@@ -611,6 +634,11 @@ if __name__ == "__main__":
     if not video_name:
         sys.exit(0)
 
-    w = MainWindow(video_name)
+    try:
+        w = MainWindow(video_name)
+    except Exception as e:
+        QMessageBox.critical(None, "Failed to open video", str(e))
+        sys.exit(1)
+
     w.showMaximized()
     sys.exit(app.exec_())
