@@ -26,7 +26,7 @@ Labels are saved as `<video_name>_ball.csv`.
 The training CSV schema is:
 
 ```text
-Frame,Visibility,X,Y,Z,Event,Timestamp,Fast
+Frame,Visibility,X,Y,Z,Event,Timestamp
 ```
 
 On the pickleball branch, events are:
