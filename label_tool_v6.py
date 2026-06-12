@@ -653,6 +653,9 @@ class MainWindow(QMainWindow):
         row['Y'] = float(y)
         self.update_frame()
 
+    def aimbot_click(self, x: int, y: int):
+        self.set_point_at(x, y)
+
     def predict_next_from_history(self) -> Optional[Tuple[float, float]]:
         """If we have >=3 visible history points, polyfit (quadratic) to predict next.
         Returns (x_pred, y_pred) or None.
