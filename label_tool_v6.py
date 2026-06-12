@@ -235,28 +235,43 @@ class VideoView(QLabel):
         self.frame_w = 1
         self.frame_h = 1
         self.zoom_factor = 1.0
+        self.pan_x = 0.5
+        self.pan_y = 0.5
+        self.pan_dragging = False
+        self.pan_last_pos = None
 
     def set_frame_pixmap(self, pixmap: QPixmap, width: int, height: int):
         self.source_pixmap = pixmap
         self.frame_w = max(1, int(width))
         self.frame_h = max(1, int(height))
+        self.clamp_pan()
         self.update_display()
 
     def clear_frame(self):
         self.source_pixmap = None
         self.displayed_pixmap = None
+        self.pan_dragging = False
+        self.pan_last_pos = None
         self.clear()
 
     def update_display(self):
         if self.source_pixmap is None or self.source_pixmap.isNull():
             self.clear()
             return
-        base_size = self.source_pixmap.size()
-        base_size.scale(self.size(), Qt.KeepAspectRatio)
-        target_w = max(1, int(base_size.width() * self.zoom_factor))
-        target_h = max(1, int(base_size.height() * self.zoom_factor))
-        self.displayed_pixmap = self.source_pixmap.scaled(
-            target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        view_w = max(1, self.width())
+        view_h = max(1, self.height())
+        src_w = max(1, self.source_pixmap.width())
+        src_h = max(1, self.source_pixmap.height())
+        visible_w = max(1, min(src_w, int(round(src_w / self.zoom_factor))))
+        visible_h = max(1, min(src_h, int(round(src_h / self.zoom_factor))))
+        self.clamp_pan()
+        left = int(round(self.pan_x * src_w - visible_w / 2))
+        top = int(round(self.pan_y * src_h - visible_h / 2))
+        left = max(0, min(src_w - visible_w, left))
+        top = max(0, min(src_h - visible_h, top))
+        cropped = self.source_pixmap.copy(left, top, visible_w, visible_h)
+        self.displayed_pixmap = cropped.scaled(
+            view_w, view_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.setPixmap(self.displayed_pixmap)
 
@@ -265,11 +280,27 @@ class VideoView(QLabel):
         self.update_display()
 
     def scale(self, factor_x, factor_y):
-        self.zoom_factor = max(0.2, min(8.0, self.zoom_factor * float(factor_x)))
+        self.zoom_around(float(factor_x), None)
+
+    def zoom_around(self, factor: float, pos):
+        before = self.view_pos_to_frame_fraction(pos) if pos is not None else None
+        old_zoom = self.zoom_factor
+        self.zoom_factor = max(1.0, min(12.0, self.zoom_factor * factor))
+        if before is not None and old_zoom != self.zoom_factor:
+            frac_x, frac_y, rel_x, rel_y = before
+            src_w = max(1, self.frame_w)
+            src_h = max(1, self.frame_h)
+            visible_w = max(1, min(src_w, int(round(src_w / self.zoom_factor))))
+            visible_h = max(1, min(src_h, int(round(src_h / self.zoom_factor))))
+            self.pan_x = frac_x + (0.5 - rel_x) * (visible_w / src_w)
+            self.pan_y = frac_y + (0.5 - rel_y) * (visible_h / src_h)
+        self.clamp_pan()
         self.update_display()
 
     def resetTransform(self):
         self.zoom_factor = 1.0
+        self.pan_x = 0.5
+        self.pan_y = 0.5
         self.update_display()
 
     def fitInView(self, *args, **kwargs):
@@ -279,18 +310,54 @@ class VideoView(QLabel):
     def sceneRect(self):
         return None
 
+    def clamp_pan(self):
+        self.pan_x = max(0.0, min(1.0, float(self.pan_x)))
+        self.pan_y = max(0.0, min(1.0, float(self.pan_y)))
+
+    def displayed_offsets(self) -> Tuple[float, float]:
+        pix = self.displayed_pixmap
+        if pix is None or pix.isNull():
+            return 0.0, 0.0
+        return (self.width() - pix.width()) / 2.0, (self.height() - pix.height()) / 2.0
+
+    def current_crop(self) -> Tuple[int, int, int, int]:
+        src_w = max(1, self.frame_w)
+        src_h = max(1, self.frame_h)
+        visible_w = max(1, min(src_w, int(round(src_w / self.zoom_factor))))
+        visible_h = max(1, min(src_h, int(round(src_h / self.zoom_factor))))
+        left = int(round(self.pan_x * src_w - visible_w / 2))
+        top = int(round(self.pan_y * src_h - visible_h / 2))
+        left = max(0, min(src_w - visible_w, left))
+        top = max(0, min(src_h - visible_h, top))
+        return left, top, visible_w, visible_h
+
+    def view_pos_to_frame_fraction(self, pos):
+        if pos is None or self.displayed_pixmap is None or self.displayed_pixmap.isNull():
+            return None
+        offset_x, offset_y = self.displayed_offsets()
+        px = pos.x() - offset_x
+        py = pos.y() - offset_y
+        if px < 0 or py < 0 or px >= self.displayed_pixmap.width() or py >= self.displayed_pixmap.height():
+            return None
+        left, top, visible_w, visible_h = self.current_crop()
+        rel_x = px / max(1, self.displayed_pixmap.width())
+        rel_y = py / max(1, self.displayed_pixmap.height())
+        frame_x = left + rel_x * visible_w
+        frame_y = top + rel_y * visible_h
+        return frame_x / max(1, self.frame_w), frame_y / max(1, self.frame_h), rel_x, rel_y
+
     def map_to_frame_xy(self, event):
         pix = self.displayed_pixmap
         if pix is None or pix.isNull():
             return -1, -1
-        offset_x = (self.width() - pix.width()) / 2.0
-        offset_y = (self.height() - pix.height()) / 2.0
+        offset_x, offset_y = self.displayed_offsets()
         px = event.pos().x() - offset_x
         py = event.pos().y() - offset_y
         if px < 0 or py < 0 or px >= pix.width() or py >= pix.height():
             return -1, -1
-        x = int(px * self.frame_w / pix.width())
-        y = int(py * self.frame_h / pix.height())
+        left, top, visible_w, visible_h = self.current_crop()
+        x = int(left + px * visible_w / pix.width())
+        y = int(top + py * visible_h / pix.height())
         return x, y
 
     def mousePressEvent(self, event):
@@ -299,6 +366,12 @@ class VideoView(QLabel):
         mw = self.window()
         if not getattr(mw, 'video_path', None):
             return super().mousePressEvent(event)
+        if event.button() == Qt.MiddleButton or (
+            event.button() == Qt.LeftButton and event.modifiers() & Qt.ShiftModifier
+        ):
+            self.pan_dragging = True
+            self.pan_last_pos = event.pos()
+            return
         x, y = self.map_to_frame_xy(event)
         if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
             if event.button() == Qt.LeftButton:
@@ -312,6 +385,18 @@ class VideoView(QLabel):
         mw = self.window()
         if mw is None or not getattr(mw, 'video_path', None):
             return super().mouseMoveEvent(event)
+        if self.pan_dragging and self.pan_last_pos is not None:
+            dx = event.pos().x() - self.pan_last_pos.x()
+            dy = event.pos().y() - self.pan_last_pos.y()
+            pix = self.displayed_pixmap
+            if pix is not None and not pix.isNull():
+                left, top, visible_w, visible_h = self.current_crop()
+                self.pan_x -= (dx / max(1, pix.width())) * (visible_w / max(1, self.frame_w))
+                self.pan_y -= (dy / max(1, pix.height())) * (visible_h / max(1, self.frame_h))
+                self.clamp_pan()
+                self.update_display()
+            self.pan_last_pos = event.pos()
+            return
         x, y = self.map_to_frame_xy(event)
         if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
             mw.update_bbox(x, y)
@@ -322,6 +407,12 @@ class VideoView(QLabel):
         mw = self.window()
         if mw is None or not getattr(mw, 'video_path', None):
             return super().mouseReleaseEvent(event)
+        if event.button() == Qt.MiddleButton or (
+            event.button() == Qt.LeftButton and self.pan_dragging
+        ):
+            self.pan_dragging = False
+            self.pan_last_pos = None
+            return
         if event.button() != Qt.LeftButton:
             return super().mouseReleaseEvent(event)
         x, y = self.map_to_frame_xy(event)
@@ -338,8 +429,13 @@ class VideoView(QLabel):
         delta = event.angleDelta().y()
         if delta == 0:
             return
-        new_val = mw.zoom_slider.value() + (1 if delta > 0 else -1)
-        mw.zoom_slider.setValue(new_val)
+        self.zoom_around(1.1 if delta > 0 else 1 / 1.1, event.pos())
+        slider_value = int(round(math.log(self.zoom_factor, 1.1))) if self.zoom_factor > 0 else 0
+        mw.zoom_slider.blockSignals(True)
+        mw.zoom_slider.setValue(max(mw.zoom_slider.minimum(), min(mw.zoom_slider.maximum(), slider_value)))
+        mw.zoom_slider.blockSignals(False)
+        mw.scale = self.zoom_factor
+        mw.zoom_label.setText(f"Zoom: {self.zoom_factor:.1f}x")
 
 
 # ======================
