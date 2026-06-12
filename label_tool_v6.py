@@ -54,7 +54,7 @@ COLORS = [
     QColor(255, 192, 203), QColor(128, 128, 0)
 ]
 
-COLUMNS = ['Frame', 'Visibility', 'X', 'Y']
+COLUMNS = ['Frame', 'Visibility', 'X', 'Y', 'Z', 'Event', 'Timestamp', 'Fast']
 VIDEO_EXTENSIONS = {
     '.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv', '.mpg', '.mpeg'
 }
@@ -72,6 +72,7 @@ def empty_row(frame_idx: int, fps: float) -> Dict:
         'Z': 0.0,
         'Event': 0,
         'Timestamp': frame_idx / fps if fps else 0.0,
+        'Fast': 0,
     }
 
 def ensure_dir(path: str):
@@ -537,8 +538,9 @@ class MainWindow(QMainWindow):
             return
         if os.path.isfile(self.csv_path):
             df = pd.read_csv(self.csv_path)
-            if not set(COLUMNS).issubset(df.columns):
-                raise ValueError(f"{self.csv_path} is missing columns from {COLUMNS}!")
+            required = {'Frame', 'Visibility', 'X', 'Y'}
+            if not required.issubset(df.columns):
+                raise ValueError(f"{self.csv_path} is missing required columns from {sorted(required)}!")
             # Build dict by index
             self.df = {int(row['Frame']): {
                 'Frame': int(row['Frame']),
@@ -547,7 +549,8 @@ class MainWindow(QMainWindow):
                 'Y': float(row['Y']),
                 'Z': float(row.get('Z', 0.0)),
                 'Event': int(row.get('Event', 0)),
-                'Timestamp': float(row.get('Timestamp', 0.0)),
+                'Timestamp': float(row.get('Timestamp', int(row['Frame']) / self.fps if self.fps else 0.0)),
+                'Fast': int(row.get('Fast', 0)),
             } for _, row in df.iterrows()}
         else:
             self.df = {}
