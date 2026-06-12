@@ -14,12 +14,13 @@ import cv2
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPainter, QIcon
+    QImage, QPixmap, QFont, QColor, QPainter, QIcon, QKeySequence
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QLabel,
     QHBoxLayout, QVBoxLayout, QSlider, QPushButton, QMessageBox, QCheckBox,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QFileDialog
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QFileDialog,
+    QScrollArea, QShortcut
 )
 
 # ======================
@@ -239,6 +240,7 @@ class VideoView(QLabel):
         self.pan_y = 0.5
         self.pan_dragging = False
         self.pan_last_pos = None
+        self.scroll_area: Optional[QScrollArea] = None
 
     def set_frame_pixmap(self, pixmap: QPixmap, width: int, height: int):
         self.source_pixmap = pixmap
@@ -258,22 +260,18 @@ class VideoView(QLabel):
         if self.source_pixmap is None or self.source_pixmap.isNull():
             self.clear()
             return
-        view_w = max(1, self.width())
-        view_h = max(1, self.height())
-        src_w = max(1, self.source_pixmap.width())
-        src_h = max(1, self.source_pixmap.height())
-        visible_w = max(1, min(src_w, int(round(src_w / self.zoom_factor))))
-        visible_h = max(1, min(src_h, int(round(src_h / self.zoom_factor))))
-        self.clamp_pan()
-        left = int(round(self.pan_x * src_w - visible_w / 2))
-        top = int(round(self.pan_y * src_h - visible_h / 2))
-        left = max(0, min(src_w - visible_w, left))
-        top = max(0, min(src_h - visible_h, top))
-        cropped = self.source_pixmap.copy(left, top, visible_w, visible_h)
-        self.displayed_pixmap = cropped.scaled(
-            view_w, view_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        viewport_size = self.size()
+        if self.scroll_area is not None:
+            viewport_size = self.scroll_area.viewport().size()
+        base_size = self.source_pixmap.size()
+        base_size.scale(viewport_size, Qt.KeepAspectRatio)
+        target_w = max(1, int(base_size.width() * self.zoom_factor))
+        target_h = max(1, int(base_size.height() * self.zoom_factor))
+        self.displayed_pixmap = self.source_pixmap.scaled(
+            target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
         self.setPixmap(self.displayed_pixmap)
+        self.resize(self.displayed_pixmap.size())
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -283,25 +281,35 @@ class VideoView(QLabel):
         self.zoom_around(float(factor_x), None)
 
     def zoom_around(self, factor: float, pos):
-        before = self.view_pos_to_frame_fraction(pos) if pos is not None else None
-        old_zoom = self.zoom_factor
+        old_w = self.displayed_pixmap.width() if self.displayed_pixmap and not self.displayed_pixmap.isNull() else 0
+        old_h = self.displayed_pixmap.height() if self.displayed_pixmap and not self.displayed_pixmap.isNull() else 0
+        rel_x = rel_y = viewport_x = viewport_y = None
+        if pos is not None and old_w > 0 and old_h > 0:
+            rel_x = pos.x() / old_w
+            rel_y = pos.y() / old_h
+            if self.scroll_area is not None:
+                viewport_x = pos.x() - self.scroll_area.horizontalScrollBar().value()
+                viewport_y = pos.y() - self.scroll_area.verticalScrollBar().value()
         self.zoom_factor = max(1.0, min(12.0, self.zoom_factor * factor))
-        if before is not None and old_zoom != self.zoom_factor:
-            frac_x, frac_y, rel_x, rel_y = before
-            src_w = max(1, self.frame_w)
-            src_h = max(1, self.frame_h)
-            visible_w = max(1, min(src_w, int(round(src_w / self.zoom_factor))))
-            visible_h = max(1, min(src_h, int(round(src_h / self.zoom_factor))))
-            self.pan_x = frac_x + (0.5 - rel_x) * (visible_w / src_w)
-            self.pan_y = frac_y + (0.5 - rel_y) * (visible_h / src_h)
-        self.clamp_pan()
         self.update_display()
+        if (
+            self.scroll_area is not None and rel_x is not None and rel_y is not None
+            and viewport_x is not None and viewport_y is not None
+            and self.displayed_pixmap is not None and not self.displayed_pixmap.isNull()
+        ):
+            hbar = self.scroll_area.horizontalScrollBar()
+            vbar = self.scroll_area.verticalScrollBar()
+            hbar.setValue(int(rel_x * self.displayed_pixmap.width() - viewport_x))
+            vbar.setValue(int(rel_y * self.displayed_pixmap.height() - viewport_y))
 
     def resetTransform(self):
         self.zoom_factor = 1.0
         self.pan_x = 0.5
         self.pan_y = 0.5
         self.update_display()
+        if self.scroll_area is not None:
+            self.scroll_area.horizontalScrollBar().setValue(0)
+            self.scroll_area.verticalScrollBar().setValue(0)
 
     def fitInView(self, *args, **kwargs):
         self.zoom_factor = 1.0
@@ -334,30 +342,26 @@ class VideoView(QLabel):
     def view_pos_to_frame_fraction(self, pos):
         if pos is None or self.displayed_pixmap is None or self.displayed_pixmap.isNull():
             return None
-        offset_x, offset_y = self.displayed_offsets()
-        px = pos.x() - offset_x
-        py = pos.y() - offset_y
+        px = pos.x()
+        py = pos.y()
         if px < 0 or py < 0 or px >= self.displayed_pixmap.width() or py >= self.displayed_pixmap.height():
             return None
-        left, top, visible_w, visible_h = self.current_crop()
         rel_x = px / max(1, self.displayed_pixmap.width())
         rel_y = py / max(1, self.displayed_pixmap.height())
-        frame_x = left + rel_x * visible_w
-        frame_y = top + rel_y * visible_h
+        frame_x = rel_x * self.frame_w
+        frame_y = rel_y * self.frame_h
         return frame_x / max(1, self.frame_w), frame_y / max(1, self.frame_h), rel_x, rel_y
 
     def map_to_frame_xy(self, event):
         pix = self.displayed_pixmap
         if pix is None or pix.isNull():
             return -1, -1
-        offset_x, offset_y = self.displayed_offsets()
-        px = event.pos().x() - offset_x
-        py = event.pos().y() - offset_y
+        px = event.pos().x()
+        py = event.pos().y()
         if px < 0 or py < 0 or px >= pix.width() or py >= pix.height():
             return -1, -1
-        left, top, visible_w, visible_h = self.current_crop()
-        x = int(left + px * visible_w / pix.width())
-        y = int(top + py * visible_h / pix.height())
+        x = int(px * self.frame_w / pix.width())
+        y = int(py * self.frame_h / pix.height())
         return x, y
 
     def mousePressEvent(self, event):
@@ -388,13 +392,11 @@ class VideoView(QLabel):
         if self.pan_dragging and self.pan_last_pos is not None:
             dx = event.pos().x() - self.pan_last_pos.x()
             dy = event.pos().y() - self.pan_last_pos.y()
-            pix = self.displayed_pixmap
-            if pix is not None and not pix.isNull():
-                left, top, visible_w, visible_h = self.current_crop()
-                self.pan_x -= (dx / max(1, pix.width())) * (visible_w / max(1, self.frame_w))
-                self.pan_y -= (dy / max(1, pix.height())) * (visible_h / max(1, self.frame_h))
-                self.clamp_pan()
-                self.update_display()
+            if self.scroll_area is not None:
+                hbar = self.scroll_area.horizontalScrollBar()
+                vbar = self.scroll_area.verticalScrollBar()
+                hbar.setValue(hbar.value() - dx)
+                vbar.setValue(vbar.value() - dy)
             self.pan_last_pos = event.pos()
             return
         x, y = self.map_to_frame_xy(event)
@@ -469,6 +471,13 @@ class MainWindow(QMainWindow):
 
         # Widgets
         self.video_view = VideoView(self)
+        self.video_scroll = QScrollArea()
+        self.video_scroll.setWidget(self.video_view)
+        self.video_scroll.setWidgetResizable(False)
+        self.video_scroll.setAlignment(Qt.AlignCenter)
+        self.video_scroll.setFocusPolicy(Qt.NoFocus)
+        self.video_view.scroll_area = self.video_scroll
+        self.video_view.setFocusPolicy(Qt.NoFocus)
         font = QFont()
 
         # Zoom controls
@@ -577,7 +586,7 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(central)
         h_layout = QHBoxLayout()
         h_layout.addWidget(left_panel, 2)
-        h_layout.addWidget(self.video_view, 12)
+        h_layout.addWidget(self.video_scroll, 12)
         h_layout.addWidget(zoom_widget, 1)
         main_layout.addLayout(h_layout)
         main_layout.addWidget(ctrl_panel)
@@ -586,6 +595,7 @@ class MainWindow(QMainWindow):
         # Timer
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.next_frame)
+        self.setup_shortcuts()
 
         self.set_video_controls_enabled(False)
         self.show_empty_view()
@@ -594,6 +604,39 @@ class MainWindow(QMainWindow):
             self.load_video(video_path)
 
     # ---------- Data IO ----------
+    def setup_shortcuts(self):
+        shortcuts = {
+            KEY_LastFrame: lambda: self.seek_frame(self.current_frame - 1),
+            KEY_NextFrame: lambda: self.seek_frame(self.current_frame + 1),
+            KEY_Last50Frame: lambda: self.seek_frame(self.current_frame - 50),
+            KEY_Next50Frame: lambda: self.seek_frame(self.current_frame + 50),
+            KEY_ClearFrame: self.clear_current_frame,
+            KEY_AimBot: self.next_frame_aimbot,
+            KEY_FlowTrack: lambda: self.optical_flow_track(FLOW_FRAMES),
+            KEY_ToggleAuto: self.toggle_auto_predict,
+            KEY_Save: self.save_with_message,
+            KEY_ExportClip: self.export_clips,
+            KEY_Quit: self.save_and_close,
+            KEY_Up: lambda: self.nudge_current_point(0, -1),
+            KEY_Left: lambda: self.nudge_current_point(-1, 0),
+            KEY_Down: lambda: self.nudge_current_point(0, 1),
+            KEY_Right: lambda: self.nudge_current_point(1, 0),
+            '0': lambda: self.set_current_event(0),
+            '1': lambda: self.set_current_event(1),
+            '2': lambda: self.set_current_event(2),
+            '3': lambda: self.set_current_event(3),
+            '4': lambda: self.set_current_event(4),
+            '5': lambda: self.set_current_event(5),
+            'Space': self.play_pause,
+            'Esc': self.confirm_close,
+        }
+        self.shortcuts = []
+        for key, callback in shortcuts.items():
+            shortcut = QShortcut(QKeySequence(key), self)
+            shortcut.setContext(Qt.WindowShortcut)
+            shortcut.activated.connect(callback)
+            self.shortcuts.append(shortcut)
+
     def has_video(self) -> bool:
         return bool(self.video_path and self.cap is not None)
 
@@ -604,6 +647,48 @@ class MainWindow(QMainWindow):
             self.speed_slider, self.slider, self.brighten_btn, self.darken_btn,
         ):
             widget.setEnabled(enabled)
+
+    def clear_current_frame(self):
+        if not self.has_video():
+            return
+        self.df[self.current_frame] = empty_row(self.current_frame, self.fps)
+        self.update_frame()
+
+    def save_with_message(self):
+        if not self.has_video():
+            return
+        self.save_csv()
+        QMessageBox.information(self, "Saved", f"Saved CSV to:\n{self.csv_path}")
+
+    def save_and_close(self):
+        if not self.has_video():
+            self.close()
+            return
+        self.save_csv()
+        self.close()
+
+    def set_current_event(self, event_id: int):
+        if not self.has_video():
+            return
+        self.ensure_row(self.current_frame)
+        self.df[self.current_frame]['Event'] = int(event_id)
+        self.update_frame()
+
+    def nudge_current_point(self, dx: int, dy: int):
+        if not self.has_video():
+            return
+        row = self.df.get(self.current_frame)
+        if not row or not row['Visibility']:
+            return
+        row['X'] = float(max(0, min(self.frame_w - 1, int(row['X']) + dx)))
+        row['Y'] = float(max(0, min(self.frame_h - 1, int(row['Y']) + dy)))
+        self.update_frame()
+
+    def toggle_auto_predict(self):
+        if not self.has_video():
+            return
+        self.auto_predict_enabled = not self.auto_predict_enabled
+        self.update_frame()
 
     def show_empty_view(self):
         self.timer.stop()
@@ -827,8 +912,7 @@ class MainWindow(QMainWindow):
     # ---------- UI plumbing ----------
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.video_view.resetTransform()
-        self.video_view.fitInView(self.video_view.sceneRect(), Qt.KeepAspectRatio)
+        self.video_view.update_display()
 
     def on_zoom_changed(self, value):
         target_scale = 1.1 ** value
