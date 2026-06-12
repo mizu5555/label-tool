@@ -23,6 +23,33 @@ Labels are saved as `<video_name>_ball.csv`.
 - Otherwise, CSV files are saved to a `csv` folder inside the video's parent
   folder.
 
+The training CSV schema is:
+
+```text
+Frame,Visibility,X,Y,Z,Event,Timestamp,Fast
+```
+
+On the pickleball branch, events are:
+
+```text
+0 Normal, 1 Hit, 2 Land, 3 Serve, 4 Net, 5 Bounce
+```
+
+Useful pickleball shortcuts:
+
+```text
+z/x      previous / next frame
+d/f      previous / next 50 frames
+v        next frame + HoughCircles aimbot
+a        optical-flow track 15 frames
+b        toggle auto predict
+c        clear current frame
+0-5      set event
+e        export labeled clips
+s        save CSV
+q        save and quit
+```
+
 ## Build
 
 Windows:

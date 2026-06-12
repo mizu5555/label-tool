@@ -30,7 +30,11 @@ KEY_NextFrame = 'x'
 KEY_Last50Frame = 'd'
 KEY_Next50Frame = 'f'
 KEY_ClearFrame = 'c'
+KEY_AimBot = 'v'
+KEY_FlowTrack = 'a'
+KEY_ToggleAuto = 'b'
 KEY_Save = 's'
+KEY_ExportClip = 'e'
 KEY_Quit = 'q'
 KEY_Esc = 27
 KEY_Up = 'i'
@@ -38,8 +42,26 @@ KEY_Left = 'j'
 KEY_Down = 'k'
 KEY_Right = 'l'
 
-AIMBOT_RANGE = 50
-LABEL_COLOR = (0, 0, 255)  # BGR
+AIMBOT_RANGE = 60
+FLOW_FRAMES = 15
+GAP_TOLERANCE = 30
+CLIP_TAIL_FRAMES = 60
+LABEL_COLORS = {
+    0: (0, 0, 255),      # Normal
+    1: (0, 255, 255),    # Hit
+    2: (0, 255, 0),      # Land
+    3: (255, 0, 0),      # Serve
+    4: (255, 180, 0),    # Net
+    5: (180, 0, 255),    # Bounce
+}
+EVENT_NAMES = {
+    0: 'Normal',
+    1: 'Hit',
+    2: 'Land',
+    3: 'Serve',
+    4: 'Net',
+    5: 'Bounce',
+}
 LABEL_SIZE = 3
 TEXT_SIZE = 0.8
 TEXT_COLOR = (0, 255, 255)  # BGR
@@ -129,6 +151,53 @@ def is_dark_frame(frame: np.ndarray) -> bool:
 def marker_radius_for_frame(frame_h: int, frame_w: int) -> int:
     radius = int(min(frame_h, frame_w) * 0.002)
     return max(MARKER_RADIUS_MIN, min(MARKER_RADIUS_MAX, radius))
+
+def event_color(event_id: int) -> Tuple[int, int, int]:
+    return LABEL_COLORS.get(int(event_id), LABEL_COLORS[0])
+
+def event_name(event_id: int) -> str:
+    return EVENT_NAMES.get(int(event_id), EVENT_NAMES[0])
+
+def to_gray(frame: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame.copy()
+
+def hough_aimbot(crop_gray: np.ndarray) -> Tuple[int, int]:
+    if crop_gray is None or crop_gray.size == 0:
+        return -1, -1
+    blurred = cv2.GaussianBlur(crop_gray, (5, 5), 1)
+    circles = cv2.HoughCircles(
+        blurred,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        minDist=10,
+        param1=50,
+        param2=15,
+        minRadius=2,
+        maxRadius=25,
+    )
+    if circles is None:
+        return -1, -1
+    c = circles[0][0]
+    return int(c[0]), int(c[1])
+
+def draw_pickleball_marker(image: np.ndarray, row: Dict):
+    if not row or not row.get('Visibility'):
+        return
+    x = int(row['X'])
+    y = int(row['Y'])
+    radius = max(2, int(row.get('Z', 0))) if row.get('Z', 0) else 6
+    color = event_color(int(row.get('Event', 0)))
+    cv2.line(image, (x - 1, y), (x + 1, y), color, 1)
+    cv2.line(image, (x, y - 1), (x, y + 1), color, 1)
+    cv2.putText(
+        image,
+        event_name(int(row.get('Event', 0))),
+        (x + radius + 4, y - 4),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        color,
+        1,
+    )
 
 def choose_video_with_dialog(initial_dir: str) -> Optional[str]:
     video_filter = (
@@ -233,11 +302,34 @@ class VideoView(QLabel):
         x, y = self.map_to_frame_xy(event)
         if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
             if event.button() == Qt.LeftButton:
-                mw.set_point_at(x, y)
+                mw.begin_bbox(x, y)
             elif event.button() == Qt.RightButton:
                 mw.aimbot_click(x, y)
         else:
             super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        mw = self.window()
+        if mw is None or not getattr(mw, 'video_path', None):
+            return super().mouseMoveEvent(event)
+        x, y = self.map_to_frame_xy(event)
+        if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
+            mw.update_bbox(x, y)
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        mw = self.window()
+        if mw is None or not getattr(mw, 'video_path', None):
+            return super().mouseReleaseEvent(event)
+        if event.button() != Qt.LeftButton:
+            return super().mouseReleaseEvent(event)
+        x, y = self.map_to_frame_xy(event)
+        if 0 <= x < mw.frame_w and 0 <= y < mw.frame_h:
+            mw.finish_bbox(x, y)
+        else:
+            mw.cancel_bbox()
+            super().mouseReleaseEvent(event)
 
     def wheelEvent(self, event):
         mw = self.window()
@@ -274,6 +366,10 @@ class MainWindow(QMainWindow):
         self.brightness = 1.0
         self.brightness_step = 0.1
         self.aimbot_pending = False
+        self.auto_predict_enabled = True
+        self.bbox_drawing = False
+        self.bbox_start: Optional[Tuple[int, int]] = None
+        self.bbox_current: Optional[Tuple[int, int]] = None
 
         # Widgets
         self.video_view = VideoView(self)
@@ -498,6 +594,10 @@ class MainWindow(QMainWindow):
         self.frame_cache[initial_frame_idx] = first_frame
         self.current_frame = initial_frame_idx
         self.brightness = 1.0
+        self.auto_predict_enabled = True
+        self.bbox_drawing = False
+        self.bbox_start = None
+        self.bbox_current = None
         self.csv_path = csv_path_for_video(video_path, create_dir=True)
         self.df = {}
         self.load_csv_if_any()
@@ -572,6 +672,62 @@ class MainWindow(QMainWindow):
         pdf = pd.DataFrame(rows, columns=COLUMNS)
         pdf.to_csv(self.csv_path, index=False, encoding='utf-8')
 
+    def export_clips(self):
+        if not self.has_video() or not self.video_path:
+            return
+        self.save_csv()
+        labeled = sorted(idx for idx, row in self.df.items() if row.get('Visibility'))
+        if not labeled:
+            QMessageBox.information(self, "Export Clips", "No labeled frames to export.")
+            return
+
+        clips = []
+        start = end = labeled[0]
+        for frame_idx in labeled[1:]:
+            if frame_idx - end <= GAP_TOLERANCE:
+                end = frame_idx
+            else:
+                clips.append((start, end))
+                start = end = frame_idx
+        clips.append((start, end))
+
+        output_root = os.path.dirname(os.path.dirname(self.csv_path)) if self.csv_path else os.path.dirname(self.video_path)
+        clip_video_dir = os.path.join(output_root, 'clips', 'video')
+        clip_csv_dir = os.path.join(output_root, 'clips', 'csv')
+        ensure_dir(clip_video_dir)
+        ensure_dir(clip_csv_dir)
+
+        base = os.path.splitext(os.path.basename(self.video_path))[0]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        exported = 0
+        for clip_idx, (start, end) in enumerate(clips):
+            clip_frames = list(range(start, min(end + CLIP_TAIL_FRAMES, self.total_frames - 1) + 1))
+            if not clip_frames:
+                continue
+            video_path = os.path.join(clip_video_dir, f"{base}_clip{clip_idx:03d}.mp4")
+            writer = cv2.VideoWriter(video_path, fourcc, self.fps, (self.frame_w, self.frame_h), isColor=True)
+            for frame_idx in clip_frames:
+                frame = self.get_frame(frame_idx)
+                if frame is not None:
+                    writer.write(frame)
+            writer.release()
+
+            csv_path = os.path.join(clip_csv_dir, f"{base}_clip{clip_idx:03d}_ball.csv")
+            rows = []
+            for new_idx, original_idx in enumerate(clip_frames):
+                row = self.df.get(original_idx, empty_row(original_idx, self.fps)).copy()
+                row['Frame'] = new_idx
+                row['Timestamp'] = new_idx / self.fps if self.fps else 0.0
+                rows.append(row)
+            pd.DataFrame(rows, columns=COLUMNS).to_csv(csv_path, index=False, encoding='utf-8')
+            exported += 1
+
+        QMessageBox.information(
+            self,
+            "Export Clips",
+            f"Exported {exported} clip(s).\nVideo: {clip_video_dir}\nCSV: {clip_csv_dir}",
+        )
+
     # ---------- UI plumbing ----------
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -626,6 +782,15 @@ class MainWindow(QMainWindow):
             return
         if self.current_frame + 1 < self.total_frames:
             self.current_frame += 1
+            prev_labeled = next(
+                (self.df[i] for i in range(self.current_frame - 1, max(self.current_frame - 51, -1), -1)
+                 if self.df.get(i, {}).get('Visibility', 0)),
+                None,
+            )
+            target_has_ball = bool(self.df.get(self.current_frame, {}).get('Visibility', 0))
+            after_land = prev_labeled is not None and int(prev_labeled.get('Event', 0)) == 2
+            if self.auto_predict_enabled and prev_labeled is not None and not target_has_ball and not after_land:
+                self.auto_predict_next(self.current_frame)
             self.update_frame()
         else:
             self.timer.stop()
@@ -651,7 +816,158 @@ class MainWindow(QMainWindow):
         row['Visibility'] = 1
         row['X'] = float(x)
         row['Y'] = float(y)
+        row['Z'] = 0.0
         self.update_frame()
+
+    def set_bbox_at(self, x0: int, y0: int, x1: int, y1: int):
+        if abs(x1 - x0) < 5 and abs(y1 - y0) < 5:
+            cx, cy, radius = x1, y1, 0
+        else:
+            cx = (x0 + x1) // 2
+            cy = (y0 + y1) // 2
+            radius = max(abs(x1 - x0), abs(y1 - y0)) // 2
+        cx = max(0, min(self.frame_w - 1, int(cx)))
+        cy = max(0, min(self.frame_h - 1, int(cy)))
+        self.ensure_row(self.current_frame)
+        row = self.df[self.current_frame]
+        row['Visibility'] = 1
+        row['X'] = float(cx)
+        row['Y'] = float(cy)
+        row['Z'] = float(radius)
+        self.update_frame()
+
+    def begin_bbox(self, x: int, y: int):
+        self.bbox_drawing = True
+        self.bbox_start = (x, y)
+        self.bbox_current = (x, y)
+        self.update_frame()
+
+    def update_bbox(self, x: int, y: int):
+        if not self.bbox_drawing:
+            return
+        self.bbox_current = (x, y)
+        self.update_frame()
+
+    def finish_bbox(self, x: int, y: int):
+        if not self.bbox_drawing or self.bbox_start is None:
+            return
+        x0, y0 = self.bbox_start
+        self.bbox_drawing = False
+        self.bbox_start = None
+        self.bbox_current = None
+        self.set_bbox_at(x0, y0, x, y)
+
+    def cancel_bbox(self):
+        self.bbox_drawing = False
+        self.bbox_start = None
+        self.bbox_current = None
+        if self.has_video():
+            self.update_frame()
+
+    def aimbot_click(self, x: int, y: int):
+        if not self.has_video():
+            return
+        frame = self.get_frame(self.current_frame)
+        x1 = max(0, x - AIMBOT_RANGE)
+        y1 = max(0, y - AIMBOT_RANGE)
+        x2 = min(self.frame_w, x + AIMBOT_RANGE)
+        y2 = min(self.frame_h, y + AIMBOT_RANGE)
+        kx, ky = hough_aimbot(to_gray(frame[y1:y2, x1:x2]))
+        self.ensure_row(self.current_frame)
+        row = self.df[self.current_frame]
+        row['Visibility'] = 1
+        row['Z'] = 0.0
+        if kx != -1:
+            row['X'] = float(x1 + kx)
+            row['Y'] = float(y1 + ky)
+        else:
+            row['X'] = float(x)
+            row['Y'] = float(y)
+        self.update_frame()
+
+    def next_frame_aimbot(self):
+        if not self.has_video():
+            return
+        if self.current_frame < self.total_frames - 1:
+            self.current_frame += 1
+        self.ensure_row(self.current_frame)
+        last_vis = next(
+            (self.df[i] for i in range(self.current_frame - 1, -1, -1)
+             if self.df.get(i, {}).get('Visibility', 0)),
+            None,
+        )
+        if last_vis:
+            self.aimbot_click(int(last_vis['X']), int(last_vis['Y']))
+        else:
+            self.update_frame()
+
+    def optical_flow_track(self, n_frames: int = FLOW_FRAMES):
+        if not self.has_video():
+            return
+        start_idx = self.current_frame
+        if self.df.get(start_idx, {}).get('Visibility', 0) == 0:
+            QMessageBox.information(self, "Flow Track", "Current frame has no labeled ball.")
+            return
+        prev_gray = to_gray(self.get_frame(start_idx))
+        pt = np.array([[self.df[start_idx]['X'], self.df[start_idx]['Y']]], dtype=np.float32).reshape(-1, 1, 2)
+        lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        end_idx = min(start_idx + n_frames, self.total_frames - 1)
+        tracked_to = start_idx
+        for idx in range(start_idx + 1, end_idx + 1):
+            cur_gray = to_gray(self.get_frame(idx))
+            new_pt, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, cur_gray, pt, None, **lk_params)
+            if status[0][0] != 1:
+                break
+            nx, ny = new_pt[0][0]
+            self.ensure_row(idx)
+            self.df[idx]['Visibility'] = 1
+            self.df[idx]['X'] = float(nx)
+            self.df[idx]['Y'] = float(ny)
+            self.df[idx]['Z'] = self.df[start_idx].get('Z', 0.0)
+            prev_gray = cur_gray
+            pt = new_pt
+            tracked_to = idx
+        self.current_frame = tracked_to
+        self.update_frame()
+
+    def auto_predict_next(self, target_idx: int):
+        prev_idx = None
+        for idx in range(target_idx - 1, max(target_idx - 10, -1), -1):
+            if self.df.get(idx, {}).get('Visibility', 0):
+                prev_idx = idx
+                break
+        if prev_idx is None:
+            return
+        prev_gray = to_gray(self.get_frame(prev_idx))
+        cur_gray = to_gray(self.get_frame(target_idx))
+        px, py = float(self.df[prev_idx]['X']), float(self.df[prev_idx]['Y'])
+        pt = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
+        lk_params = dict(
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        new_pt, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, cur_gray, pt, None, **lk_params)
+        if status[0][0] == 1:
+            nx, ny = new_pt[0][0]
+            if abs(nx - px) < 80 and abs(ny - py) < 80:
+                self.ensure_row(target_idx)
+                self.df[target_idx].update(Visibility=1, X=float(nx), Y=float(ny), Z=self.df[prev_idx].get('Z', 0.0))
+                return
+        x = int(px)
+        y = int(py)
+        x1 = max(0, x - AIMBOT_RANGE)
+        y1 = max(0, y - AIMBOT_RANGE)
+        x2 = min(self.frame_w, x + AIMBOT_RANGE)
+        y2 = min(self.frame_h, y + AIMBOT_RANGE)
+        kx, ky = hough_aimbot(cur_gray[y1:y2, x1:x2])
+        if kx != -1:
+            self.ensure_row(target_idx)
+            self.df[target_idx].update(Visibility=1, X=float(x1 + kx), Y=float(y1 + ky), Z=self.df[prev_idx].get('Z', 0.0))
 
     def predict_next_from_history(self) -> Optional[Tuple[float, float]]:
         """If we have >=3 visible history points, polyfit (quadratic) to predict next.
@@ -692,28 +1008,15 @@ class MainWindow(QMainWindow):
         frame_mean = float(src.mean())
         frame_max = int(src.max())
 
-        # draw history with fading alpha
-        marker_radius = marker_radius_for_frame(self.frame_h, self.frame_w)
-        font_scale = max(0.3, marker_radius / 4.0)
-        thickness = max(1, marker_radius)
-
-        if self.show_history:
-            for h in range(1, HISTORY+1):
-                idx = self.current_frame - h
-                if idx < 0:
-                    break
-                row = self.df.get(idx)
-                if not row or not row['Visibility']:
-                    continue
-                alpha = (HISTORY + 1 - h) / (HISTORY + 1)
-                overlay = display.copy()
-                cv2.circle(overlay, (int(row['X']), int(row['Y'])), marker_radius, LABEL_COLOR, -1)
-                cv2.addWeighted(overlay, alpha, display, 1-alpha, 0, display)
-
         # current
         rowc = self.df.get(self.current_frame)
-        if rowc and rowc['Visibility']:
-            cv2.circle(display, (int(rowc['X']), int(rowc['Y'])), marker_radius, LABEL_COLOR, -1)
+        draw_pickleball_marker(display, rowc)
+
+        if self.bbox_drawing and self.bbox_start and self.bbox_current:
+            x0, y0 = self.bbox_start
+            x1, y1 = self.bbox_current
+            cv2.rectangle(display, (x0, y0), (x1, y1), (0, 200, 255), 1)
+            cv2.drawMarker(display, ((x0 + x1) // 2, (y0 + y1) // 2), (0, 200, 255), cv2.MARKER_CROSS, 10, 1)
 
         # Push to Qt through encoded image bytes instead of raw ndarray memory.
         # This avoids format/stride issues that can show up as black or rainbow frames.
@@ -734,7 +1037,8 @@ class MainWindow(QMainWindow):
         # labels
         ev = rowc['Event'] if rowc else 0
         self.frame_label.setText(f"Frame: {self.current_frame}/{self.total_frames-1}")
-        self.event_label.setText(f"Event: {ev}")
+        auto_txt = "ON" if self.auto_predict_enabled else "OFF"
+        self.event_label.setText(f"Event: {ev} {event_name(ev)}\nAuto: {auto_txt}")
         self.decode_label.setText(f"Decoded: mean {frame_mean:.1f}, max {frame_max}")
         self.slider.setValue(self.current_frame)
 
@@ -764,13 +1068,22 @@ class MainWindow(QMainWindow):
         elif text == KEY_ClearFrame:
             self.df[self.current_frame] = empty_row(self.current_frame, self.fps)
             self.update_frame()
+        elif text == KEY_AimBot:
+            self.next_frame_aimbot()
+        elif text == KEY_FlowTrack:
+            self.optical_flow_track(FLOW_FRAMES)
+        elif text == KEY_ToggleAuto:
+            self.auto_predict_enabled = not self.auto_predict_enabled
+            self.update_frame()
         elif text == KEY_Save:
             self.save_csv()
             QMessageBox.information(self, "Saved", f"Saved CSV to:\n{self.csv_path}")
+        elif text == KEY_ExportClip:
+            self.export_clips()
         elif text == KEY_Quit:
             self.save_csv()
             self.close()
-        elif text in ('0', '1', '2', '3'):
+        elif text in ('0', '1', '2', '3', '4', '5'):
             self.ensure_row(self.current_frame)
             self.df[self.current_frame]['Event'] = int(text)
             self.update_frame()
