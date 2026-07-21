@@ -3,7 +3,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from label_tool_v6 import MainWindow, bbox_to_ball, empty_row
+from label_tool_v6 import (
+    MainWindow,
+    bbox_to_ball,
+    empty_row,
+    ensure_subdir,
+    group_labeled_frames,
+)
 
 
 class BboxToBallTests(unittest.TestCase):
@@ -73,6 +79,30 @@ class LabelCsvRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded['Z'], 5.5)
         self.assertEqual(loaded['Event'], 3)
         self.assertAlmostEqual(loaded['Timestamp'], 7 / 30.0)
+
+
+class SafeOutputPathTests(unittest.TestCase):
+    def test_creates_nested_directory_below_root(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            created = Path(ensure_subdir(tmp_dir, 'clips', 'video'))
+            self.assertTrue(created.is_dir())
+            self.assertEqual(created, Path(tmp_dir).resolve() / 'clips' / 'video')
+
+    def test_rejects_directory_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self.assertRaises(ValueError):
+                ensure_subdir(tmp_dir, '..', 'outside')
+
+
+class ClipGroupingTests(unittest.TestCase):
+    def test_groups_frames_within_gap_tolerance(self):
+        self.assertEqual(
+            group_labeled_frames([1, 5, 35, 66], gap_tolerance=30),
+            [(1, 35), (66, 66)],
+        )
+
+    def test_empty_labels_produce_no_clips(self):
+        self.assertEqual(group_labeled_frames([]), [])
 
 
 if __name__ == '__main__':

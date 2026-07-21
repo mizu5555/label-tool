@@ -6,6 +6,7 @@ import math
 import csv
 from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -97,9 +98,16 @@ def empty_row(frame_idx: int, fps: float) -> Dict:
         'Timestamp': frame_idx / fps if fps else 0.0,
     }
 
-def ensure_dir(path: str):
-    if not os.path.exists(path):
-        os.makedirs(path)
+def ensure_subdir(root: str, *parts: str) -> str:
+    """Create a resolved subdirectory without allowing traversal above root."""
+    root_path = Path(root).expanduser().resolve()
+    target = root_path.joinpath(*parts).resolve()
+    try:
+        target.relative_to(root_path)
+    except ValueError as exc:
+        raise ValueError(f"Output directory escapes its root: {target}") from exc
+    target.mkdir(parents=True, exist_ok=True)
+    return str(target)
 
 def app_base_dir() -> str:
     if getattr(sys, 'frozen', False):
@@ -138,9 +146,10 @@ def csv_path_for_video(video_path: str, create_dir: bool = True) -> str:
         output_root = os.path.dirname(video_dir)
     else:
         output_root = video_dir
-    csv_dir = os.path.join(output_root, 'csv')
-    if create_dir:
-        ensure_dir(csv_dir)
+    csv_dir = (
+        ensure_subdir(output_root, 'csv')
+        if create_dir else os.path.join(output_root, 'csv')
+    )
     csv_file_name = os.path.splitext(os.path.basename(video_path))[0] + '_ball.csv'
     return os.path.join(csv_dir, csv_file_name)
 
@@ -241,12 +250,34 @@ def choose_video_with_dialog(initial_dir: str) -> Optional[str]:
     return video_path or None
 
 def resolve_video_path() -> Optional[str]:
-    if len(sys.argv) >= 2 and not os.path.isdir(sys.argv[1]):
-        return sys.argv[1]
+    if len(sys.argv) < 2:
+        return None
 
-    work_dir = app_base_dir() if len(sys.argv) < 2 else os.path.abspath(sys.argv[1])
-    os.chdir(work_dir)
-    return None
+    try:
+        candidate = Path(sys.argv[1]).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"Path does not exist or cannot be resolved: {sys.argv[1]}") from exc
+    if candidate.is_dir():
+        return None
+    if not candidate.is_file() or candidate.suffix.lower() not in VIDEO_EXTENSIONS:
+        raise ValueError(f"Not a supported video file: {candidate}")
+    return str(candidate)
+
+def group_labeled_frames(
+    labeled_frames: List[int], gap_tolerance: int = GAP_TOLERANCE
+) -> List[Tuple[int, int]]:
+    if not labeled_frames:
+        return []
+    clips = []
+    start = end = labeled_frames[0]
+    for frame_idx in labeled_frames[1:]:
+        if frame_idx - end <= gap_tolerance:
+            end = frame_idx
+        else:
+            clips.append((start, end))
+            start = end = frame_idx
+    clips.append((start, end))
+    return clips
 
 # ======================
 # Graphics View
@@ -921,52 +952,66 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Export Clips", "No labeled frames to export.")
             return
 
-        clips = []
-        start = end = labeled[0]
-        for frame_idx in labeled[1:]:
-            if frame_idx - end <= GAP_TOLERANCE:
-                end = frame_idx
-            else:
-                clips.append((start, end))
-                start = end = frame_idx
-        clips.append((start, end))
-
         output_root = os.path.dirname(os.path.dirname(self.csv_path)) if self.csv_path else os.path.dirname(self.video_path)
-        clip_video_dir = os.path.join(output_root, 'clips', 'video')
-        clip_csv_dir = os.path.join(output_root, 'clips', 'csv')
-        ensure_dir(clip_video_dir)
-        ensure_dir(clip_csv_dir)
+        clip_video_dir = ensure_subdir(output_root, 'clips', 'video')
+        clip_csv_dir = ensure_subdir(output_root, 'clips', 'csv')
 
         base = os.path.splitext(os.path.basename(self.video_path))[0]
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        exported = 0
-        for clip_idx, (start, end) in enumerate(clips):
-            clip_frames = list(range(start, min(end + CLIP_TAIL_FRAMES, self.total_frames - 1) + 1))
-            if not clip_frames:
-                continue
-            video_path = os.path.join(clip_video_dir, f"{base}_clip{clip_idx:03d}.mp4")
-            writer = cv2.VideoWriter(video_path, fourcc, self.fps, (self.frame_w, self.frame_h), isColor=True)
-            for frame_idx in clip_frames:
-                frame = self.get_frame(frame_idx)
-                if frame is not None:
-                    writer.write(frame)
-            writer.release()
-
-            csv_path = os.path.join(clip_csv_dir, f"{base}_clip{clip_idx:03d}_ball.csv")
-            rows = []
-            for new_idx, original_idx in enumerate(clip_frames):
-                row = self.df.get(original_idx, empty_row(original_idx, self.fps)).copy()
-                row['Frame'] = new_idx
-                row['Timestamp'] = new_idx / self.fps if self.fps else 0.0
-                rows.append(row)
-            pd.DataFrame(rows, columns=COLUMNS).to_csv(csv_path, index=False, encoding='utf-8')
-            exported += 1
+        clips = group_labeled_frames(labeled)
+        exported = sum(
+            self._export_clip(clip_idx, bounds, base, clip_video_dir, clip_csv_dir)
+            for clip_idx, bounds in enumerate(clips)
+        )
 
         QMessageBox.information(
             self,
             "Export Clips",
             f"Exported {exported} clip(s).\nVideo: {clip_video_dir}\nCSV: {clip_csv_dir}",
         )
+
+    def _export_clip(
+        self,
+        clip_idx: int,
+        bounds: Tuple[int, int],
+        base: str,
+        clip_video_dir: str,
+        clip_csv_dir: str,
+    ) -> int:
+        start, end = bounds
+        final_frame = min(end + CLIP_TAIL_FRAMES, self.total_frames - 1)
+        clip_frames = list(range(start, final_frame + 1))
+        if not clip_frames:
+            return 0
+
+        video_path = os.path.join(clip_video_dir, f"{base}_clip{clip_idx:03d}.mp4")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(
+            video_path, fourcc, self.fps,
+            (self.frame_w, self.frame_h), isColor=True,
+        )
+        for frame_idx in clip_frames:
+            frame = self.get_frame(frame_idx)
+            if frame is not None:
+                writer.write(frame)
+        writer.release()
+
+        csv_path = os.path.join(clip_csv_dir, f"{base}_clip{clip_idx:03d}_ball.csv")
+        rows = [
+            self._clip_csv_row(new_idx, original_idx)
+            for new_idx, original_idx in enumerate(clip_frames)
+        ]
+        pd.DataFrame(rows, columns=COLUMNS).to_csv(
+            csv_path, index=False, encoding='utf-8'
+        )
+        return 1
+
+    def _clip_csv_row(self, new_idx: int, original_idx: int) -> Dict:
+        row = self.df.get(
+            original_idx, empty_row(original_idx, self.fps)
+        ).copy()
+        row['Frame'] = new_idx
+        row['Timestamp'] = new_idx / self.fps if self.fps else 0.0
+        return row
 
     # ---------- UI plumbing ----------
     def resizeEvent(self, event):
@@ -1144,11 +1189,13 @@ class MainWindow(QMainWindow):
             return
         prev_gray = to_gray(self.get_frame(start_idx))
         pt = np.array([[self.df[start_idx]['X'], self.df[start_idx]['Y']]], dtype=np.float32).reshape(-1, 1, 2)
-        lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
-        )
+        lk_params = {
+            'winSize': (21, 21),
+            'maxLevel': 3,
+            'criteria': (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03
+            ),
+        }
         end_idx = min(start_idx + n_frames, self.total_frames - 1)
         tracked_to = start_idx
         for idx in range(start_idx + 1, end_idx + 1):
@@ -1180,11 +1227,13 @@ class MainWindow(QMainWindow):
         cur_gray = to_gray(self.get_frame(target_idx))
         px, py = float(self.df[prev_idx]['X']), float(self.df[prev_idx]['Y'])
         pt = np.array([[px, py]], dtype=np.float32).reshape(-1, 1, 2)
-        lk_params = dict(
-            winSize=(21, 21),
-            maxLevel=3,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
-        )
+        lk_params = {
+            'winSize': (21, 21),
+            'maxLevel': 3,
+            'criteria': (
+                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03
+            ),
+        }
         new_pt, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, cur_gray, pt, None, **lk_params)
         if status[0][0] == 1:
             nx, ny = new_pt[0][0]
@@ -1396,7 +1445,11 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    video_name = resolve_video_path()
+    try:
+        video_name = resolve_video_path()
+    except ValueError as e:
+        QMessageBox.critical(None, "Invalid video path", str(e))
+        video_name = None
     try:
         w = MainWindow(video_name)
     except Exception as e:
