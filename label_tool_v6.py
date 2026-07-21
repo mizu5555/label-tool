@@ -14,7 +14,7 @@ import cv2
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPainter, QIcon, QKeySequence
+    QImage, QPixmap, QFont, QColor, QPainter, QPen, QIcon, QKeySequence
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QLabel,
@@ -152,6 +152,34 @@ def marker_radius_for_frame(frame_h: int, frame_w: int) -> int:
     radius = int(min(frame_h, frame_w) * 0.002)
     return max(MARKER_RADIUS_MIN, min(MARKER_RADIUS_MAX, radius))
 
+def bbox_to_ball(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    frame_w: int,
+    frame_h: int,
+) -> Tuple[float, float, float]:
+    """Convert a drag box to a clamped center point and enclosing radius."""
+    if frame_w <= 0 or frame_h <= 0:
+        raise ValueError("Frame dimensions must be positive.")
+
+    x0 = max(0, min(frame_w - 1, int(x0)))
+    y0 = max(0, min(frame_h - 1, int(y0)))
+    x1 = max(0, min(frame_w - 1, int(x1)))
+    y1 = max(0, min(frame_h - 1, int(y1)))
+    width = abs(x1 - x0)
+    height = abs(y1 - y0)
+
+    if width == 0 and height == 0:
+        return float(x1), float(y1), 0.0
+
+    return (
+        (x0 + x1) / 2.0,
+        (y0 + y1) / 2.0,
+        max(width, height) / 2.0,
+    )
+
 def event_color(event_id: int) -> Tuple[int, int, int]:
     return LABEL_COLORS.get(int(event_id), LABEL_COLORS[0])
 
@@ -275,6 +303,39 @@ class VideoView(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_display()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        mw = self.window()
+        pix = self.displayed_pixmap
+        if (
+            pix is None or pix.isNull() or mw is None
+            or not getattr(mw, 'bbox_drawing', False)
+            or mw.bbox_start is None or mw.bbox_current is None
+        ):
+            return
+
+        offset_x, offset_y = self.displayed_offsets()
+        scale_x = pix.width() / max(1, self.frame_w)
+        scale_y = pix.height() / max(1, self.frame_h)
+        x0, y0 = mw.bbox_start
+        x1, y1 = mw.bbox_current
+        left = int(round(offset_x + min(x0, x1) * scale_x))
+        top = int(round(offset_y + min(y0, y1) * scale_y))
+        right = int(round(offset_x + max(x0, x1) * scale_x))
+        bottom = int(round(offset_y + max(y0, y1) * scale_y))
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+
+        painter = QPainter(self)
+        pen = QPen(QColor(255, 160, 0))
+        pen.setWidth(1)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.drawRect(left, top, max(1, right - left), max(1, bottom - top))
+        painter.drawLine(center_x - 4, center_y, center_x + 4, center_y)
+        painter.drawLine(center_x, center_y - 4, center_x, center_y + 4)
+        painter.end()
 
     def scale(self, factor_x, factor_y):
         self.zoom_around(float(factor_x), None)
@@ -998,20 +1059,15 @@ class MainWindow(QMainWindow):
         self.update_frame()
 
     def set_bbox_at(self, x0: int, y0: int, x1: int, y1: int):
-        if abs(x1 - x0) < 5 and abs(y1 - y0) < 5:
-            cx, cy, radius = x1, y1, 0
-        else:
-            cx = (x0 + x1) // 2
-            cy = (y0 + y1) // 2
-            radius = max(abs(x1 - x0), abs(y1 - y0)) // 2
-        cx = max(0, min(self.frame_w - 1, int(cx)))
-        cy = max(0, min(self.frame_h - 1, int(cy)))
+        cx, cy, radius = bbox_to_ball(
+            x0, y0, x1, y1, self.frame_w, self.frame_h
+        )
         self.ensure_row(self.current_frame)
         row = self.df[self.current_frame]
         row['Visibility'] = 1
-        row['X'] = float(cx)
-        row['Y'] = float(cy)
-        row['Z'] = float(radius)
+        row['X'] = cx
+        row['Y'] = cy
+        row['Z'] = radius
         self.update_frame()
 
     def begin_bbox(self, x: int, y: int):
@@ -1189,12 +1245,6 @@ class MainWindow(QMainWindow):
         # current
         rowc = self.df.get(self.current_frame)
         draw_pickleball_marker(display, rowc)
-
-        if self.bbox_drawing and self.bbox_start and self.bbox_current:
-            x0, y0 = self.bbox_start
-            x1, y1 = self.bbox_current
-            cv2.rectangle(display, (x0, y0), (x1, y1), (0, 200, 255), 1)
-            cv2.drawMarker(display, ((x0 + x1) // 2, (y0 + y1) // 2), (0, 200, 255), cv2.MARKER_CROSS, 10, 1)
 
         # Push to Qt through encoded image bytes instead of raw ndarray memory.
         # This avoids format/stride issues that can show up as black or rainbow frames.
