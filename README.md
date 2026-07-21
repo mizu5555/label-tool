@@ -14,6 +14,14 @@ python -m venv .venv
 If no video path is provided, the app opens first without a video. Use the
 `Open Video` button on the left panel to choose or switch videos.
 
+## Split Video
+
+Use the `Split Video` button to divide the current video (or choose another
+video) by a user-selected number of minutes. At 150 fps, the recommended
+default is 2 minutes (18,000 frames) and segments of 5 minutes (45,000 frames)
+or less are recommended for labeling. Split files are written beside the
+source video in a new folder and contain video only (no audio).
+
 ## CSV Output
 
 Labels are saved as `<video_name>_ball.csv`.

@@ -6,8 +6,10 @@ from types import SimpleNamespace
 from label_tool_v6 import (
     MainWindow,
     bbox_to_ball,
+    compatible_output_fps,
     empty_row,
     ensure_subdir,
+    frames_per_segment,
     group_labeled_frames,
 )
 
@@ -103,6 +105,26 @@ class ClipGroupingTests(unittest.TestCase):
 
     def test_empty_labels_produce_no_clips(self):
         self.assertEqual(group_labeled_frames([]), [])
+
+
+class VideoSplitMathTests(unittest.TestCase):
+    def test_150_fps_two_minutes_is_18000_frames(self):
+        self.assertEqual(frames_per_segment(150.0, 2.0), 18000)
+
+    def test_fractional_fps_is_rounded_to_nearest_frame(self):
+        self.assertEqual(frames_per_segment(29.97, 0.5), 899)
+
+    def test_invalid_values_are_rejected(self):
+        with self.assertRaises(ValueError):
+            frames_per_segment(0, 2)
+        with self.assertRaises(ValueError):
+            frames_per_segment(150, 0)
+
+    def test_camera_fps_is_normalized_for_mpeg4_writer(self):
+        self.assertEqual(compatible_output_fps(150.00181140089785), 150.0)
+
+    def test_ntsc_fps_keeps_three_decimal_precision(self):
+        self.assertEqual(compatible_output_fps(29.970029), 29.97)
 
 
 if __name__ == '__main__':

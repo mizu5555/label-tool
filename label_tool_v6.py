@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QLabel,
     QHBoxLayout, QVBoxLayout, QSlider, QPushButton, QMessageBox, QCheckBox,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QFileDialog,
-    QScrollArea, QShortcut
+    QScrollArea, QShortcut, QInputDialog, QProgressDialog
 )
 
 # ======================
@@ -82,6 +82,8 @@ COLUMNS = ['Frame', 'Visibility', 'X', 'Y', 'Z', 'Event', 'Timestamp']
 VIDEO_EXTENSIONS = {
     '.mp4', '.avi', '.mov', '.mkv', '.m4v', '.wmv', '.mpg', '.mpeg'
 }
+DEFAULT_SPLIT_MINUTES = 2.0
+RECOMMENDED_MAX_SPLIT_MINUTES = 5.0
 
 # ======================
 # Helpers
@@ -278,6 +280,107 @@ def group_labeled_frames(
             start = end = frame_idx
     clips.append((start, end))
     return clips
+
+def frames_per_segment(fps: float, minutes: float) -> int:
+    """Convert a requested segment duration to a positive whole frame count."""
+    if fps <= 0:
+        raise ValueError("Video FPS must be positive.")
+    if minutes <= 0:
+        raise ValueError("Segment duration must be positive.")
+    return max(1, int(round(fps * minutes * 60.0)))
+
+def compatible_output_fps(fps: float) -> float:
+    """Avoid MPEG-4 time bases that OpenCV cannot encode.
+
+    Some cameras report values such as 150.001811 even though the stream is
+    nominally 150 fps. Passing that value directly to OpenCV's MPEG-4 writer
+    can produce a time-base denominator above the codec's limit.
+    """
+    if fps <= 0:
+        raise ValueError("Video FPS must be positive.")
+    nearest_integer = round(fps)
+    if abs(fps - nearest_integer) < 0.01:
+        return float(nearest_integer)
+    return round(fps, 3)
+
+def split_video_into_segments(
+    video_path: str,
+    output_dir: str,
+    minutes: float,
+    progress_callback=None,
+) -> Tuple[List[str], bool]:
+    """Split a video on exact frame boundaries. Returns (files, cancelled).
+
+    OpenCV is used so the packaged label tool has no external FFmpeg dependency.
+    The generated MP4 files intentionally contain video only.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if fps <= 0:
+        cap.release()
+        raise ValueError("Cannot determine a valid FPS for this video.")
+    total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if width <= 0 or height <= 0:
+        cap.release()
+        raise ValueError("Cannot determine the video dimensions.")
+
+    segment_frames = frames_per_segment(fps, minutes)
+    output_fps = compatible_output_fps(fps)
+    output_path = Path(output_dir).resolve()
+    output_path.mkdir(parents=True, exist_ok=True)
+    base = Path(video_path).stem
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = None
+    current_path: Optional[Path] = None
+    created_files: List[str] = []
+    frame_idx = 0
+    cancelled = False
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if frame_idx % segment_frames == 0:
+                if writer is not None:
+                    writer.release()
+                part_number = frame_idx // segment_frames + 1
+                current_path = output_path / f"{base}_part{part_number:03d}.mp4"
+                if current_path.exists():
+                    raise FileExistsError(f"Output file already exists: {current_path}")
+                writer = cv2.VideoWriter(
+                    str(current_path), fourcc, output_fps, (width, height), isColor=True
+                )
+                if not writer.isOpened():
+                    raise ValueError(
+                        f"Cannot create output video: {current_path}\n"
+                        f"Codec: mp4v, source FPS: {fps:g}, output FPS: {output_fps:g}, "
+                        f"size: {width}x{height}"
+                    )
+                created_files.append(str(current_path))
+
+            writer.write(frame)
+            frame_idx += 1
+            if progress_callback and frame_idx % 100 == 0:
+                if progress_callback(frame_idx, total_frames, str(current_path)) is False:
+                    cancelled = True
+                    break
+    finally:
+        if writer is not None:
+            writer.release()
+        cap.release()
+
+    if frame_idx == 0:
+        raise ValueError("The video has no readable frames.")
+    if progress_callback:
+        progress_callback(frame_idx, total_frames, str(current_path or ''))
+    return created_files, cancelled
 
 # ======================
 # Graphics View
@@ -607,6 +710,9 @@ class MainWindow(QMainWindow):
         self.open_video_btn = QPushButton("Open Video")
         self.open_video_btn.setFont(font)
         self.open_video_btn.clicked.connect(self.open_video_dialog)
+        self.split_video_btn = QPushButton("Split Video")
+        self.split_video_btn.setFont(font)
+        self.split_video_btn.clicked.connect(self.split_video_dialog)
 
         # Navigation & controls
         font.setPointSize(16)
@@ -655,6 +761,7 @@ class MainWindow(QMainWindow):
         left_layout.addSpacing(16)
         left_layout.addWidget(self.frame_label)
         left_layout.addWidget(self.open_video_btn)
+        left_layout.addWidget(self.split_video_btn)
         left_layout.addSpacing(16)
         left_layout.addWidget(self.event_label)
         left_layout.addWidget(self.decode_label)
@@ -825,6 +932,110 @@ class MainWindow(QMainWindow):
             self.load_video(video_path)
         except Exception as e:
             QMessageBox.critical(self, "Failed to open video", str(e))
+
+    def split_video_dialog(self):
+        source_path = self.video_path
+        if not source_path:
+            video_dir = os.path.join(app_base_dir(), 'video')
+            initial_dir = video_dir if os.path.isdir(video_dir) else app_base_dir()
+            source_path = choose_video_with_dialog(initial_dir)
+        if not source_path:
+            return
+
+        source = Path(source_path).resolve()
+        probe = cv2.VideoCapture(str(source))
+        source_fps = float(probe.get(cv2.CAP_PROP_FPS) or 0.0) if probe.isOpened() else 0.0
+        total_frames = (
+            max(0, int(probe.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+            if probe.isOpened() else 0
+        )
+        probe.release()
+        fps_description = (
+            f"{source_fps:g} fps = {int(round(source_fps * 60)):,} frames/minute"
+            if source_fps > 0 else "duration will use the video's FPS"
+        )
+        minutes, accepted = QInputDialog.getDouble(
+            self,
+            "Split Video",
+            f"Minutes per segment ({fps_description}):",
+            DEFAULT_SPLIT_MINUTES,
+            0.1,
+            60.0,
+            1,
+        )
+        if not accepted:
+            return
+        if minutes > RECOMMENDED_MAX_SPLIT_MINUTES:
+            estimated_frames = (
+                int(round(source_fps * minutes * 60)) if source_fps > 0 else None
+            )
+            frame_note = (
+                f"This is about {estimated_frames:,} frames per segment.\n"
+                if estimated_frames is not None else ""
+            )
+            duration_note = (
+                f"At {source_fps:g} fps, {minutes:g} minutes was selected.\n"
+                if source_fps > 0 else f"{minutes:g} minutes was selected.\n"
+            )
+            answer = QMessageBox.question(
+                self,
+                "Long segments",
+                f"{duration_note}"
+                f"{frame_note}"
+                f"For labeling, {RECOMMENDED_MAX_SPLIT_MINUTES:g} minutes or less is recommended. "
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
+        duration_tag = f"{minutes:g}".replace('.', '_')
+        output_dir = source.parent / f"{source.stem}_split_{duration_tag}min"
+        suffix = 2
+        while output_dir.exists():
+            output_dir = source.parent / f"{source.stem}_split_{duration_tag}min_{suffix}"
+            suffix += 1
+
+        progress = QProgressDialog("Preparing video split...", "Cancel", 0, max(1, total_frames), self)
+        progress.setWindowTitle("Split Video")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def report_progress(done, total, current_file):
+            if total > 0 and progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setValue(min(done, progress.maximum()))
+            if current_file:
+                progress.setLabelText(
+                    f"Writing {Path(current_file).name}\n{done:,} / {total:,} frames"
+                    if total else f"Writing {Path(current_file).name}\n{done:,} frames"
+                )
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            files, cancelled = split_video_into_segments(
+                str(source), str(output_dir), minutes, report_progress
+            )
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Video split failed", str(e))
+            return
+        progress.close()
+
+        if cancelled:
+            QMessageBox.information(
+                self,
+                "Split cancelled",
+                f"Cancelled after creating {len(files)} file(s).\nOutput: {output_dir}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Split complete",
+                f"Created {len(files)} video-only MP4 file(s).\nOutput: {output_dir}",
+            )
 
     def load_video(self, video_path: str):
         video_path = os.path.abspath(video_path)
