@@ -226,8 +226,8 @@ def draw_pickleball_marker(image: np.ndarray, row: Dict):
     y = int(row['Y'])
     radius = max(2, int(row.get('Z', 0))) if row.get('Z', 0) else 6
     color = event_color(int(row.get('Event', 0)))
-    cv2.line(image, (x - 1, y), (x + 1, y), color, 1)
-    cv2.line(image, (x, y - 1), (x, y + 1), color, 1)
+    if 0 <= x < image.shape[1] and 0 <= y < image.shape[0]:
+        image[y, x] = color
     cv2.putText(
         image,
         event_name(int(row.get('Event', 0))),
@@ -1084,6 +1084,12 @@ class MainWindow(QMainWindow):
         self.csv_path = csv_path_for_video(video_path, create_dir=True)
         self.df = {}
         self.load_csv_if_any()
+        labeled_frames = [
+            idx for idx, row in self.df.items()
+            if 0 <= idx < self.total_frames and row.get('Visibility', 0)
+        ]
+        if labeled_frames:
+            self.current_frame = max(labeled_frames)
 
         self.slider.setRange(0, self.total_frames - 1)
         self.slider.setValue(self.current_frame)
