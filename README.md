@@ -73,5 +73,12 @@ chmod +x scripts/build.sh
 ./scripts/build.sh
 ```
 
+macOS release builds produce `dist/Label Tool.app` and should be launched with:
+
+```bash
+PYTHON=/opt/homebrew/bin/python3.12 ./scripts/build.sh
+open "dist/Label Tool.app"
+```
+
 See [PACKAGING.md](PACKAGING.md) for GitHub Actions builds for Windows, macOS,
 and Linux.

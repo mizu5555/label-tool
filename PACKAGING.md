@@ -27,10 +27,44 @@ chmod +x scripts/build.sh
 ./scripts/build.sh
 ```
 
-The output is:
+On Linux, the output is:
 
 ```text
 dist/label_tool
+```
+
+On macOS, build with Python 3.12 for the PyQt5/PyInstaller frozen app:
+
+```bash
+brew install python@3.12
+PYTHON=/opt/homebrew/bin/python3.12 ./scripts/build.sh
+```
+
+The output is:
+
+```text
+dist/Label Tool.app
+```
+
+Launch it with:
+
+```bash
+open "dist/Label Tool.app"
+```
+
+For a debug build that prints frozen-app tracebacks in Terminal:
+
+```bash
+DEBUG=1 PYTHON=/opt/homebrew/bin/python3.12 ./scripts/build.sh
+./dist/label_tool
+```
+
+If a copied, downloaded, or unzipped app is blocked by Gatekeeper quarantine on
+another Mac, remove the quarantine attribute before launching:
+
+```bash
+xattr -dr com.apple.quarantine "dist/Label Tool.app"
+open "dist/Label Tool.app"
 ```
 
 ## GitHub Actions build

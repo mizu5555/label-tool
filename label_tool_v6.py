@@ -1653,8 +1653,16 @@ class MainWindow(QMainWindow):
 # ======================
 # Entrypoint
 # ======================
-if __name__ == "__main__":
+def activate_main_window(window: QMainWindow) -> None:
+    window.raise_()
+    window.activateWindow()
+
+
+def main() -> int:
     app = QApplication(sys.argv)
+    app.setApplicationName("Label Tool")
+    app.setApplicationDisplayName("Label Tool")
+    app.setOrganizationName("mizu")
 
     try:
         video_name = resolve_video_path()
@@ -1668,4 +1676,9 @@ if __name__ == "__main__":
         w = MainWindow()
 
     w.showMaximized()
-    sys.exit(app.exec_())
+    QTimer.singleShot(0, lambda: activate_main_window(w))
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
