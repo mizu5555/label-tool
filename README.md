@@ -58,6 +58,14 @@ s        save CSV
 q        save and quit
 ```
 
+## Validation Video
+
+After opening a video, its matching CSV points are shown directly in the main
+video view during playback. Use `Export Validation Video` to permanently draw
+the points and event names onto a video-only MP4. The result is written to a
+new `validation` folder, and the app can open it in the system video player
+when export finishes.
+
 ## Build
 
 Windows:

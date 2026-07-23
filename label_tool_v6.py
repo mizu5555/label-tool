@@ -13,9 +13,10 @@ import numpy as np
 import pandas as pd
 import cv2
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import (
-    QImage, QPixmap, QFont, QColor, QPainter, QPen, QIcon, QKeySequence
+    QImage, QPixmap, QFont, QColor, QPainter, QPen, QIcon, QKeySequence,
+    QDesktopServices,
 )
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QListWidget, QListWidgetItem, QLabel,
@@ -219,19 +220,37 @@ def hough_aimbot(crop_gray: np.ndarray) -> Tuple[int, int]:
     c = circles[0][0]
     return int(c[0]), int(c[1])
 
-def draw_pickleball_marker(image: np.ndarray, row: Dict):
+def draw_pickleball_marker(
+    image: np.ndarray,
+    row: Dict,
+    marker_style: str = 'cross',
+):
     if not row or not row.get('Visibility'):
         return
-    x = int(row['X'])
-    y = int(row['Y'])
-    radius = max(2, int(row.get('Z', 0))) if row.get('Z', 0) else 6
-    color = event_color(int(row.get('Event', 0)))
-    if 0 <= x < image.shape[1] and 0 <= y < image.shape[0]:
-        image[y, x] = color
+    try:
+        x_value = float(row['X'])
+        y_value = float(row['Y'])
+        event_id = int(row.get('Event', 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if not (math.isfinite(x_value) and math.isfinite(y_value)):
+        return
+    x = int(round(x_value))
+    y = int(round(y_value))
+    color = event_color(event_id)
+    if not (0 <= x < image.shape[1] and 0 <= y < image.shape[0]):
+        return
+    if marker_style == 'dot':
+        cv2.circle(image, (x, y), 2, color, -1, cv2.LINE_AA)
+    else:
+        cv2.drawMarker(
+            image, (x, y), color, cv2.MARKER_CROSS,
+            3, 1, cv2.LINE_AA,
+        )
     cv2.putText(
         image,
-        event_name(int(row.get('Event', 0))),
-        (x + radius + 4, y - 4),
+        event_name(event_id),
+        (x + 8, y - 4),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.4,
         color,
@@ -381,6 +400,63 @@ def split_video_into_segments(
     if progress_callback:
         progress_callback(frame_idx, total_frames, str(current_path or ''))
     return created_files, cancelled
+
+
+def export_validation_video(
+    video_path: str,
+    output_path: str,
+    rows: Dict[int, Dict],
+    progress_callback=None,
+) -> Tuple[int, bool]:
+    """Write CSV labels onto every frame and return (written_frames, cancelled)."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if fps <= 0 or width <= 0 or height <= 0:
+        cap.release()
+        raise ValueError("Cannot determine valid video FPS or dimensions.")
+
+    destination = Path(output_path).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(destination),
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        compatible_output_fps(fps),
+        (width, height),
+        isColor=True,
+    )
+    if not writer.isOpened():
+        cap.release()
+        raise ValueError(f"Cannot create validation video: {destination}")
+
+    frame_idx = 0
+    cancelled = False
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            draw_pickleball_marker(frame, rows.get(frame_idx), marker_style='dot')
+            writer.write(frame)
+            frame_idx += 1
+            if progress_callback and frame_idx % 100 == 0:
+                if progress_callback(frame_idx, total_frames) is False:
+                    cancelled = True
+                    break
+    finally:
+        writer.release()
+        cap.release()
+
+    if frame_idx == 0:
+        raise ValueError("The video has no readable frames.")
+    if progress_callback:
+        progress_callback(frame_idx, total_frames)
+    return frame_idx, cancelled
 
 # ======================
 # Graphics View
@@ -713,6 +789,9 @@ class MainWindow(QMainWindow):
         self.split_video_btn = QPushButton("Split Video")
         self.split_video_btn.setFont(font)
         self.split_video_btn.clicked.connect(self.split_video_dialog)
+        self.validation_video_btn = QPushButton("Export Validation Video")
+        self.validation_video_btn.setFont(font)
+        self.validation_video_btn.clicked.connect(self.export_validation_video_dialog)
 
         # Navigation & controls
         font.setPointSize(16)
@@ -762,6 +841,7 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.frame_label)
         left_layout.addWidget(self.open_video_btn)
         left_layout.addWidget(self.split_video_btn)
+        left_layout.addWidget(self.validation_video_btn)
         left_layout.addSpacing(16)
         left_layout.addWidget(self.event_label)
         left_layout.addWidget(self.decode_label)
@@ -843,6 +923,7 @@ class MainWindow(QMainWindow):
             self.zoom_slider, self.history_checkbox, self.play_btn,
             self.prev50_btn, self.prev1_btn, self.next1_btn, self.next50_btn,
             self.speed_slider, self.slider, self.brighten_btn, self.darken_btn,
+            self.validation_video_btn,
         ):
             widget.setEnabled(enabled)
 
@@ -1036,6 +1117,80 @@ class MainWindow(QMainWindow):
                 "Split complete",
                 f"Created {len(files)} video-only MP4 file(s).\nOutput: {output_dir}",
             )
+
+    def export_validation_video_dialog(self):
+        if not self.has_video() or not self.video_path:
+            return
+        try:
+            self.save_csv()
+        except Exception as e:
+            QMessageBox.critical(self, "CSV save failed", str(e))
+            return
+
+        source = Path(self.video_path).resolve()
+        output_root = source.parent.parent if source.parent.name.lower() == 'video' else source.parent
+        output_dir = Path(ensure_subdir(str(output_root), 'validation'))
+        output_path = output_dir / f"{source.stem}_validation.mp4"
+        suffix = 2
+        while output_path.exists():
+            output_path = output_dir / f"{source.stem}_validation_{suffix}.mp4"
+            suffix += 1
+
+        progress = QProgressDialog(
+            "Writing CSV points onto video...",
+            "Cancel",
+            0,
+            max(1, self.total_frames),
+            self,
+        )
+        progress.setWindowTitle("Export Validation Video")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+
+        def report_progress(done, total):
+            if total > 0 and progress.maximum() != total:
+                progress.setMaximum(total)
+            progress.setValue(min(done, progress.maximum()))
+            progress.setLabelText(
+                f"Writing {output_path.name}\n{done:,} / {total:,} frames"
+                if total else f"Writing {output_path.name}\n{done:,} frames"
+            )
+            QApplication.processEvents()
+            return not progress.wasCanceled()
+
+        try:
+            written, cancelled = export_validation_video(
+                str(source), str(output_path), self.df, report_progress
+            )
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Validation export failed", str(e))
+            return
+        progress.close()
+
+        if cancelled:
+            QMessageBox.information(
+                self,
+                "Export cancelled",
+                f"Cancelled after {written:,} frames.\nPartial video: {output_path}",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Validation video ready",
+            f"Wrote {written:,} frames.\nOutput: {output_path}\n\n"
+            "Open the exported video now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_path))):
+                QMessageBox.information(
+                    self,
+                    "Open video",
+                    f"Could not start the default video player.\nVideo: {output_path}",
+                )
 
     def load_video(self, video_path: str):
         video_path = os.path.abspath(video_path)

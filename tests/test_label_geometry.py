@@ -3,12 +3,17 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import cv2
+import numpy as np
+
 from label_tool_v6 import (
     MainWindow,
     bbox_to_ball,
     compatible_output_fps,
+    draw_pickleball_marker,
     empty_row,
     ensure_subdir,
+    export_validation_video,
     frames_per_segment,
     group_labeled_frames,
 )
@@ -125,6 +130,53 @@ class VideoSplitMathTests(unittest.TestCase):
 
     def test_ntsc_fps_keeps_three_decimal_precision(self):
         self.assertEqual(compatible_output_fps(29.970029), 29.97)
+
+
+class ValidationVideoTests(unittest.TestCase):
+    def test_marker_changes_pixels_around_csv_point(self):
+        image = np.zeros((60, 80, 3), dtype=np.uint8)
+        row = empty_row(0, 30.0)
+        row.update(Visibility=1, X=30, Y=20, Z=5, Event=3)
+
+        draw_pickleball_marker(image, row)
+
+        self.assertGreater(int(image[14:27, 24:37].sum()), 0)
+
+    def test_exports_every_frame_with_labels_burned_in(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "source.mp4"
+            output = Path(tmp_dir) / "validation" / "source_validation.mp4"
+            writer = cv2.VideoWriter(
+                str(source),
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                10.0,
+                (64, 48),
+                isColor=True,
+            )
+            self.assertTrue(writer.isOpened())
+            for _ in range(3):
+                writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+            writer.release()
+
+            row = empty_row(1, 10.0)
+            row.update(Visibility=1, X=20, Y=20, Z=5, Event=1)
+            written, cancelled = export_validation_video(
+                str(source), str(output), {1: row}
+            )
+
+            self.assertEqual(written, 3)
+            self.assertFalse(cancelled)
+            self.assertTrue(output.is_file())
+            cap = cv2.VideoCapture(str(output))
+            frames = []
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            cap.release()
+            self.assertEqual(len(frames), 3)
+            self.assertGreater(int(frames[1][14:27, 14:27].sum()), 0)
 
 
 if __name__ == '__main__':
