@@ -58,6 +58,12 @@ s        save CSV
 q        save and quit
 ```
 
+## Pre-labeling CameraSensor Recordings
+
+`prelabel/prelabel.py` creates videos with labels already filled in from a
+CameraSensor replay session, so labeling becomes reviewing. See
+[prelabel/README.md](prelabel/README.md).
+
 ## Validation Video
 
 After opening a video, its matching CSV points are shown directly in the main

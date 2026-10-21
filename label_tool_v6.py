@@ -156,6 +156,27 @@ def csv_path_for_video(video_path: str, create_dir: bool = True) -> str:
     csv_file_name = os.path.splitext(os.path.basename(video_path))[0] + '_ball.csv'
     return os.path.join(csv_dir, csv_file_name)
 
+# Pre-label sources (prelabel/prelabel.py review files) that mean "decided: no ball here".
+NO_BALL_SOURCES = {'idle', 'dead', 'pre', 'out', 'out_est'}
+
+
+def review_path_for_video(video_path: str) -> str:
+    """review/<video>.csv written by prelabel.py, next to csv/ (same layout rules)."""
+    csv_path = csv_path_for_video(video_path, create_dir=False)
+    name = os.path.basename(csv_path)[:-len('_ball.csv')]
+    return os.path.join(os.path.dirname(os.path.dirname(csv_path)), 'review', name + '.csv')
+
+
+def load_no_ball_frames(review_path: str) -> set:
+    """Frames a pre-label marked as having no ball in play; empty when there is no review file."""
+    if not os.path.isfile(review_path):
+        return set()
+    df = pd.read_csv(review_path)
+    if not {'Frame', 'source'}.issubset(df.columns):
+        return set()
+    return set(df.Frame[df.source.isin(NO_BALL_SOURCES)].astype(int))
+
+
 def is_dark_frame(frame: np.ndarray) -> bool:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     return float(gray.mean()) < 3.0 and int(gray.max()) < 18
@@ -735,6 +756,7 @@ class MainWindow(QMainWindow):
         self.brightness_step = 0.1
         self.aimbot_pending = False
         self.auto_predict_enabled = True
+        self.no_ball_frames: set = set()
         self.bbox_drawing = False
         self.bbox_start: Optional[Tuple[int, int]] = None
         self.bbox_current: Optional[Tuple[int, int]] = None
@@ -1239,6 +1261,7 @@ class MainWindow(QMainWindow):
         self.csv_path = csv_path_for_video(video_path, create_dir=True)
         self.df = {}
         self.load_csv_if_any()
+        self.no_ball_frames = load_no_ball_frames(review_path_for_video(video_path))
         labeled_frames = [
             idx for idx, row in self.df.items()
             if 0 <= idx < self.total_frames and row.get('Visibility', 0)
@@ -1445,7 +1468,9 @@ class MainWindow(QMainWindow):
             )
             target_has_ball = bool(self.df.get(self.current_frame, {}).get('Visibility', 0))
             after_land = prev_labeled is not None and int(prev_labeled.get('Event', 0)) == 2
-            if self.auto_predict_enabled and prev_labeled is not None and not target_has_ball and not after_land:
+            known_empty = self.current_frame in self.no_ball_frames  # pre-label says no ball in play
+            if (self.auto_predict_enabled and prev_labeled is not None and not target_has_ball
+                    and not after_land and not known_empty):
                 self.auto_predict_next(self.current_frame)
             self.update_frame()
         else:
